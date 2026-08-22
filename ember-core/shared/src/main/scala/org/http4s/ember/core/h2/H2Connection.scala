@@ -335,7 +335,9 @@ private[h2] class H2Connection[F[_]](
             case H2Connection.ConnectionType.Server => headers.identifier % 2 != 0
             case H2Connection.ConnectionType.Client => headers.identifier % 2 == 0
           }
-          if (!isValidToCreate || headers.identifier <= s.remoteHighestStream) {
+          if (
+            !isValidToCreate || headers.identifier <= 0 || headers.identifier <= s.remoteHighestStream
+          ) {
             logger.warn(
               s"Not Valid Stream to Create ${headers.identifier} - $isValidToCreate, " +
                 s"${s.remoteHighestStream} - Protocol Error - Issuing GoAway"
@@ -470,7 +472,7 @@ private[h2] class H2Connection[F[_]](
               s.receivePushPromise(h, List.empty)
             case None =>
               val isValidToCreate = i % 2 == 0
-              if (!isValidToCreate || i <= s.remoteHighestStream) {
+              if (!isValidToCreate || i <= 0 || i <= s.remoteHighestStream) {
                 logger.warn(
                   s"Not Valid Stream to Create $i - $isValidToCreate, ${s.remoteHighestStream} - Protocol Error - Issuing GoAway"
                 )

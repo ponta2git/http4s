@@ -68,6 +68,7 @@ class H2ConnectionSuite extends Http4sSuite {
   private def mkConnection(
       localSettings: H2Frame.Settings.ConnectionSettings,
       input: ByteVector,
+      connectionType: H2Connection.ConnectionType = H2Connection.ConnectionType.Server,
   ): IO[H2Connection[IO]] =
     for {
       socket <- readOnlySocket(input)
@@ -88,7 +89,7 @@ class H2ConnectionSuite extends Http4sSuite {
       logger <- NoOpFactory[IO].fromClass(classOf[H2ConnectionSuite])
     } yield new H2Connection[IO](
       addr,
-      H2Connection.ConnectionType.Server,
+      connectionType,
       Duration.Inf,
       Duration.Inf,
       localSettings,
@@ -227,7 +228,12 @@ class H2ConnectionSuite extends Http4sSuite {
     val frames = for {
       encoder <- Hpack.create[IO](1024)
       headerBlock <- encoder.encodeHeaders(
-        NonEmptyList.of((":method", "GET", false), (":path", "/", false))
+        NonEmptyList.of(
+          (":method", "GET", false),
+          (":path", "/", false),
+          (":scheme", "https", false),
+          (":authority", "example.com", false),
+        )
       )
       h2 <- mkConnection(
         H2Frame.Settings.ConnectionSettings.default,
@@ -276,6 +282,39 @@ class H2ConnectionSuite extends Http4sSuite {
     }
   }
 
+  test("PUSH_PROMISE on a closed stream still reserves its promised stream") {
+    val result = for {
+      encoder <- Hpack.create[IO](1024)
+      headerBlock <- encoder.encodeHeaders(
+        NonEmptyList.of(
+          (":method", "GET", false),
+          (":path", "/", false),
+          (":scheme", "https", false),
+          (":authority", "example.com", false),
+        )
+      )
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(
+          H2Frame.PushPromise(2, endHeaders = true, 4, headerBlock, None),
+          H2Frame.Ping.default,
+        ),
+        H2Connection.ConnectionType.Client,
+      )
+      _ <- h2.initiateRemoteStreamById(2)
+      _ <- h2.mapRef.update(_ - 2)
+      _ <- h2.readLoop
+      outgoing <- drainOutgoing(h2)
+      promised <- h2.mapRef.get.map(_.get(4).get).flatMap(_.state.get)
+    } yield (outgoing, promised.state)
+
+    result.map { case (outgoing, promisedState) =>
+      assert(!outgoing.exists(_.isInstanceOf[H2Frame.GoAway]), clue(outgoing))
+      assert(outgoing.contains(H2Frame.Ping.ack), clue(outgoing))
+      assertEquals(promisedState, H2Stream.StreamState.ReservedRemote)
+    }
+  }
+
   test("late RST_STREAM for a closed stream is discarded") {
     val input = frameBytes(
       H2Frame.RstStream(1, H2Error.Cancel.value),
@@ -292,6 +331,35 @@ class H2ConnectionSuite extends Http4sSuite {
       assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
       assert(!frames.exists(_.isInstanceOf[H2Frame.RstStream]), clue(frames))
       assert(frames.contains(H2Frame.Ping.ack), clue(frames))
+    }
+  }
+
+  test("late frames for a retained closed stream are discarded") {
+    val result = for {
+      encoder <- Hpack.create[IO](1024)
+      headerBlock <- encoder.encodeHeaders(
+        NonEmptyList.of((":method", "GET", false), (":path", "/", false))
+      )
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(
+          H2Frame.WindowUpdate(1, 1),
+          H2Frame.Data(1, ByteVector.view(Array[Byte](1, 2, 3)), None, endStream = false),
+          H2Frame.Headers(1, None, endStream = true, endHeaders = true, headerBlock, None),
+          H2Frame.RstStream(1, H2Error.Cancel.value),
+          H2Frame.Ping.default,
+        ),
+      )
+      stream <- h2.initiateRemoteStreamById(1)
+      _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Closed))
+      _ <- h2.readLoop
+      outgoing <- drainOutgoing(h2)
+    } yield outgoing
+
+    result.map { outgoing =>
+      assert(!outgoing.exists(_.isInstanceOf[H2Frame.GoAway]), clue(outgoing))
+      assert(!outgoing.exists(_.isInstanceOf[H2Frame.RstStream]), clue(outgoing))
+      assert(outgoing.contains(H2Frame.Ping.ack), clue(outgoing))
     }
   }
 }
