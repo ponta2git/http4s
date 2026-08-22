@@ -79,8 +79,7 @@ private[h2] class H2Connection[F[_]](
       }
       (
         s.copy(
-          highestStream = newHighest,
-          localHighestStream = Math.max(s.localHighestStream, newHighest),
+          highestStream = newHighest
         ),
         (s.remoteSettings, newHighest),
       )
@@ -167,8 +166,7 @@ private[h2] class H2Connection[F[_]](
     _ <- mapRef.update(m => m + (id -> stream))
     _ <- state.update(s =>
       s.copy(
-        highestStream = Math.max(s.highestStream, id),
-        remoteHighestStream = Math.max(s.remoteHighestStream, id),
+        remoteHighestStream = Math.max(s.remoteHighestStream, id)
       )
     )
   } yield stream
@@ -188,7 +186,7 @@ private[h2] class H2Connection[F[_]](
 
   private def isKnownStreamId(id: Int, s: H2Connection.State[F]): Boolean =
     if (id <= 0) false
-    else if (isLocalStreamId(id)) id <= s.localHighestStream
+    else if (isLocalStreamId(id)) id <= s.highestStream
     else id <= s.remoteHighestStream
 
   private def discardHeaders(
@@ -358,7 +356,7 @@ private[h2] class H2Connection[F[_]](
       // Headers if not closed MUST
       case (
             c @ H2Frame.Continuation(id, true, _),
-            H2Connection.State(_, _, _, _, _, _, _, _, Some(headers), None, _),
+            H2Connection.State(_, _, _, _, _, _, _, Some(headers), None, _),
           ) =>
         if (headers.first.identifier == id) {
           state.update(s => s.copy(headersInProgress = None)) >>
@@ -371,7 +369,7 @@ private[h2] class H2Connection[F[_]](
         }
       case (
             c @ H2Frame.Continuation(id, true, _),
-            H2Connection.State(_, _, _, _, _, _, _, _, None, Some(pushPromise), _),
+            H2Connection.State(_, _, _, _, _, _, _, None, Some(pushPromise), _),
           ) =>
         if (pushPromise.first.promisedStreamId == id) {
           state.update(s => s.copy(pushPromiseInProgress = None)) >>
@@ -396,7 +394,7 @@ private[h2] class H2Connection[F[_]](
         }
       case (
             c @ H2Frame.Continuation(id, false, _),
-            H2Connection.State(_, _, _, _, _, _, _, _, None, Some(pushPromise), _),
+            H2Connection.State(_, _, _, _, _, _, _, None, Some(pushPromise), _),
           ) =>
         if (pushPromise.first.identifier != id) {
           logger.warn("Invalid Continuation - Protocol Error - Issuing GoAway") >>
@@ -410,7 +408,7 @@ private[h2] class H2Connection[F[_]](
 
       case (
             c @ H2Frame.Continuation(id, false, _),
-            H2Connection.State(_, _, _, _, _, _, _, _, Some(headers), None, _),
+            H2Connection.State(_, _, _, _, _, _, _, Some(headers), None, _),
           ) =>
         if (headers.first.identifier != id) {
           logger.warn("Invalid Continuation - Protocol Error - Issuing GoAway") >>
@@ -421,13 +419,13 @@ private[h2] class H2Connection[F[_]](
         } else {
           state.update(s => s.copy(headersInProgress = headers.addContinuation(c).some))
         }
-      case (f, H2Connection.State(_, _, _, _, _, _, _, _, Some(_), None, _)) =>
+      case (f, H2Connection.State(_, _, _, _, _, _, _, Some(_), None, _)) =>
         // Only Continuation Frames Are Valid While there is a value
         logger.warn(
           s"Continuation for headers in process, retrieved unexpected frame $f -  Protocol Error - Issuing GoAway"
         ) >>
           goAway(H2Error.ProtocolError)
-      case (f, H2Connection.State(_, _, _, _, _, _, _, _, None, Some(_), _)) =>
+      case (f, H2Connection.State(_, _, _, _, _, _, _, None, Some(_), _)) =>
         // Only Continuation Frames Are Valid While there is a value
         logger.warn(
           s"Continuation for push promise in process, retrieved unexpected frame $f -  Protocol Error - Issuing GoAway"
@@ -691,8 +689,7 @@ private[h2] object H2Connection {
       writeWindow: Int,
       writeBlock: Deferred[F, Either[Throwable, Unit]],
       readWindow: Int,
-      highestStream: Int,
-      localHighestStream: Int,
+      highestStream: Int, // highest stream ID initiated locally
       remoteHighestStream: Int,
       closed: Boolean,
       headersInProgress: Option[ContinuationProgress[F, H2Frame.Headers]],
@@ -737,7 +734,6 @@ private[h2] object H2Connection {
         writeBlock,
         readWindow.windowSize,
         highestStream = 0,
-        localHighestStream = 0,
         remoteHighestStream = 0,
         closed = false,
         headersInProgress = None,
