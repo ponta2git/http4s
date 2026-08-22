@@ -188,7 +188,7 @@ private[ember] class H2Client[F[_]](
         stateRef <- H2Connection.initState[F](
           defaultSettings,
           defaultSettings.initialWindowSize,
-          localSettings.initialWindowSize,
+          defaultSettings.initialWindowSize,
         )
         queue <- cats.effect.std.Queue.bounded[F, Chunk[H2Frame]](128)
         hpack <- Hpack.create[F](

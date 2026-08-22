@@ -364,6 +364,22 @@ class H2StreamSuite extends Http4sSuite {
     }
   }
 
+  test("sendData can end a stream with an empty DATA frame when the window is zero") {
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, queue) = sq
+      _ <- stream.state.update(_.copy(writeWindow = 0))
+      _ <- stream.sendData(ByteVector.empty, endStream = true)
+      outgoing <- queue.take
+      updated <- stream.state.get
+      data = outgoing.collectFirst { case frame: H2Frame.Data => frame }
+    } yield {
+      assertEquals(data.map(_.data), Some(ByteVector.empty))
+      assertEquals(data.map(_.endStream), Some(true))
+      assertEquals(updated.state, H2Stream.StreamState.HalfClosedLocal)
+    }
+  }
+
   test("sendData preserves stallStart across a sub-chunk drip") {
     TestControl.executeEmbed {
       for {
@@ -385,18 +401,91 @@ class H2StreamSuite extends Http4sSuite {
   test("receiveWindowUpdate ignores updates after the local side has closed") {
     for {
       sq <- streamAndQueue(defaultSettings)
-      (stream, _) = sq
+      (stream, queue) = sq
       _ <- stream.state.update(
         _.copy(state = H2Stream.StreamState.HalfClosedLocal, writeWindow = 0)
       )
       _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 10))
+      _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 0))
       halfClosed <- stream.state.get
       _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Closed, writeWindow = 0))
       _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 10))
       closed <- stream.state.get
+      outgoing <- queue.tryTake
     } yield {
       assertEquals(halfClosed.writeWindow, 0)
       assertEquals(closed.writeWindow, 0)
+      assertEquals(outgoing, None)
     }
+  }
+
+  test("SETTINGS_INITIAL_WINDOW_SIZE does not adjust inactive send windows") {
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, _) = sq
+      _ <- stream.state.update(
+        _.copy(state = H2Stream.StreamState.HalfClosedLocal, writeWindow = 10)
+      )
+      _ <- stream.modifyWriteWindow(5)
+      updated <- stream.state.get
+    } yield assertEquals(updated.writeWindow, 10)
+  }
+
+  test("receiveWindowUpdate restores a negative stream window") {
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, queue) = sq
+      _ <- stream.state.update(_.copy(writeWindow = -10))
+      _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 5))
+      updated <- stream.state.get
+      outgoing <- queue.tryTake
+    } yield {
+      assertEquals(updated.state, H2Stream.StreamState.Open)
+      assertEquals(updated.writeWindow, -5)
+      assertEquals(outgoing, None)
+    }
+  }
+
+  test("receiveWindowUpdate does not wrap an overflowing stream window") {
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, queue) = sq
+      _ <- stream.state.update(_.copy(writeWindow = Int.MaxValue))
+      _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 1))
+      updated <- stream.state.get
+      outgoing <- queue.take
+      reset = outgoing.collectFirst { case frame: H2Frame.RstStream => frame }
+    } yield {
+      assertEquals(updated.state, H2Stream.StreamState.Closed)
+      assertEquals(updated.writeWindow, Int.MaxValue)
+      assertEquals(reset.map(_.value.toInt), Some(H2Error.FlowControlError.value))
+    }
+  }
+
+  test("receiveData counts padding against the stream flow-control window") {
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, queue) = sq
+      _ <- stream.state.update(_.copy(readWindow = 2))
+      _ <- stream.receiveData(
+        H2Frame.Data(1, ByteVector.empty, Some(ByteVector.fill(2)(0)), endStream = false)
+      )
+      updated <- stream.state.get
+      outgoing <- queue.take
+      reset = outgoing.collectFirst { case frame: H2Frame.RstStream => frame }
+    } yield {
+      assertEquals(updated.state, H2Stream.StreamState.Closed)
+      assertEquals(reset.map(_.value.toInt), Some(H2Error.FlowControlError.value))
+    }
+  }
+
+  test("rstStream is a no-op after the stream is closed") {
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, queue) = sq
+      _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Closed))
+      _ <- stream.rstStream(H2Error.StreamClosed)
+      outgoing <- queue.tryTake
+    } yield assertEquals(outgoing, None)
   }
 }

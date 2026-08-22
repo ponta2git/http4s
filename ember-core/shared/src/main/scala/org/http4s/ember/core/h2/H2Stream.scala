@@ -50,7 +50,15 @@ private[h2] class H2Stream[F[_]: Temporal](
     val goAway: H2Error => F[Unit],
     private[this] val logger: Logger[F],
 ) {
-  import H2Stream.StreamState
+  import H2Stream.{StreamState, WindowUpdateResult}
+
+  private def withHpackErrorHandling[A](fa: F[A]): F[A] =
+    fa.onError {
+      case e @ EmberException.MessageTooLong(_) =>
+        logger.debug(e)("Headers too large") >> goAway(H2Error.EnhanceYourCalm)
+      case e =>
+        logger.error(e)("Issue in headers") >> goAway(H2Error.CompressionError)
+    }
 
   def sendPushPromise(originating: Int, headers: NonEmptyList[(String, String, Boolean)]): F[Unit] =
     connectionType match {
@@ -142,7 +150,7 @@ private[h2] class H2Stream[F[_]: Temporal](
   def sendData(bv: ByteVector, endStream: Boolean): F[Unit] = state.get.flatMap { s =>
     s.state match {
       case StreamState.Open | StreamState.HalfClosedRemote =>
-        if (bv.size.toInt <= s.writeWindow && s.writeWindow > 0) {
+        if (bv.size.toInt <= s.writeWindow) {
           enqueue.offer(Chunk.singleton(H2Frame.Data(id, bv, None, endStream))) >>
             state
               .modify { s =>
@@ -213,6 +221,10 @@ private[h2] class H2Stream[F[_]: Temporal](
         state.update(s => s.copy(contentLengthCheck = Some((length, 0))))
       }
 
+    val block = headers.headerBlock ++ continuations.foldLeft(ByteVector.empty) {
+      case (acc, cont) => acc ++ cont.headerBlockFragment
+    }
+
     state.get.flatMap { s =>
       def attribute(mess: Message[Pure]): mess.Self = {
         val iMess = mess.withAttribute(H2Keys.StreamIdentifier, id)
@@ -223,17 +235,8 @@ private[h2] class H2Stream[F[_]: Temporal](
       s.state match {
         case StreamState.Open | StreamState.HalfClosedLocal | StreamState.Idle |
             StreamState.ReservedRemote =>
-          val block = headers.headerBlock ++ continuations.foldLeft(ByteVector.empty) {
-            case (acc, cont) => acc ++ cont.headerBlockFragment
-          }
           for {
-            h <- hpack.decodeHeaders(block).onError {
-              case e @ EmberException.MessageTooLong(_) =>
-                logger.debug(e)(s"Headers too large") >> goAway(H2Error.EnhanceYourCalm)
-
-              case e =>
-                logger.error(e)(s"Issue in headers") >> goAway(H2Error.CompressionError)
-            }
+            h <- withHpackErrorHandling(hpack.decodeHeaders(block))
             newstate =
               if (headers.endStream) s.state match {
                 case StreamState.Open => StreamState.HalfClosedRemote // Client
@@ -289,8 +292,11 @@ private[h2] class H2Stream[F[_]: Temporal](
                 }
             }
           } yield ()
-        case StreamState.HalfClosedRemote | StreamState.Closed =>
-          goAway(H2Error.StreamClosed)
+        case StreamState.HalfClosedRemote =>
+          withHpackErrorHandling(hpack.decodeHeadersAndDiscard(block)) >>
+            rstStream(H2Error.StreamClosed)
+        case StreamState.Closed =>
+          withHpackErrorHandling(hpack.decodeHeadersAndDiscard(block))
         case StreamState.ReservedLocal =>
           goAway(H2Error.ProtocolError)
       }
@@ -309,13 +315,7 @@ private[h2] class H2Stream[F[_]: Temporal](
               case (acc, cont) => acc ++ cont.headerBlockFragment
             }
             for {
-              h <- hpack.decodeHeaders(block).onError {
-                case e @ EmberException.MessageTooLong(_) =>
-                  logger.debug(e)(s"Headers too large") >> goAway(H2Error.EnhanceYourCalm)
-
-                case e =>
-                  logger.error(e)("Issue in headers") >> goAway(H2Error.CompressionError)
-              }
+              h <- withHpackErrorHandling(hpack.decodeHeaders(block))
               _ <- state.update(s => s.copy(state = StreamState.ReservedRemote))
               _ <- PseudoHeaders.headersToRequestNoBody(h) match {
                 case Some(req) =>
@@ -340,7 +340,7 @@ private[h2] class H2Stream[F[_]: Temporal](
       case StreamState.Open | StreamState.HalfClosedLocal =>
         import localSettings.initialWindowSize.windowSize
 
-        val newSize = s.readWindow - data.data.size.toInt
+        val newSize = s.readWindow - data.flowControlledSize
         val newState = if (data.endStream) s.state match {
           case StreamState.Open => StreamState.HalfClosedRemote
           case StreamState.HalfClosedLocal => StreamState.Closed
@@ -351,51 +351,59 @@ private[h2] class H2Stream[F[_]: Temporal](
         val sizeReadOk = !data.endStream ||
           s.contentLengthCheck.forall { case (max, current) => max === (current + data.data.size) }
 
-        val isClosed = newState == StreamState.Closed
-
-        val needsWindowUpdate = newSize <= (windowSize / 2)
-        for {
-          _ <- state.update(s =>
-            s.copy(
-              state = newState,
-              readWindow = if (needsWindowUpdate) windowSize else newSize,
-              contentLengthCheck = s.contentLengthCheck.map { case (max, current) =>
-                (max, current + data.data.size)
-              },
+        if (newSize < 0) rstStream(H2Error.FlowControlError)
+        else {
+          val isClosed = newState == StreamState.Closed
+          val needsWindowUpdate = newSize <= (windowSize / 2)
+          for {
+            _ <- state.update(s =>
+              s.copy(
+                state = newState,
+                readWindow = if (needsWindowUpdate) windowSize else newSize,
+                contentLengthCheck = s.contentLengthCheck.map { case (max, current) =>
+                  (max, current + data.data.size)
+                },
+              )
             )
-          )
-          _ <-
-            if (sizeReadOk) s.readBuffer.send(Right(data.data)).void
-            else rstStream(H2Error.ProtocolError)
+            _ <-
+              if (sizeReadOk) s.readBuffer.send(Right(data.data)).void
+              else rstStream(H2Error.ProtocolError)
 
-          _ <-
-            if (needsWindowUpdate && !isClosed && sizeReadOk) {
-              enqueue.offer(Chunk.singleton(H2Frame.WindowUpdate(id, windowSize - newSize)))
-            } else Applicative[F].unit
-          _ <-
-            if (data.endStream) s.readBuffer.close *> s.trailWith(List.empty).void
-            else Applicative[F].unit
-          _ <-
-            if (isClosed && sizeReadOk) onClosed else Applicative[F].unit
-        } yield ()
+            _ <-
+              if (needsWindowUpdate && !isClosed && sizeReadOk) {
+                enqueue.offer(Chunk.singleton(H2Frame.WindowUpdate(id, windowSize - newSize)))
+              } else Applicative[F].unit
+            _ <-
+              if (data.endStream) s.readBuffer.close *> s.trailWith(List.empty).void
+              else Applicative[F].unit
+            _ <-
+              if (isClosed && sizeReadOk) onClosed else Applicative[F].unit
+          } yield ()
+        }
       case StreamState.Idle =>
         goAway(H2Error.ProtocolError)
       case StreamState.HalfClosedRemote =>
         rstStream(H2Error.StreamClosed)
       case StreamState.Closed => Applicative[F].unit
       case StreamState.ReservedLocal | StreamState.ReservedRemote =>
-        goAway(H2Error.InternalError) // Not Implemented Push promise Support
+        goAway(H2Error.ProtocolError)
     }
   }
 
   def rstStream(error: H2Error): F[Unit] = {
     val rst = error.toRst(id)
-    for {
-      s <- state.modify(s => (s.copy(state = StreamState.Closed), s))
-      _ <- enqueue.offer(Chunk.singleton(rst))
-      _ <- s.cancelWith(s"Sending RstStream, cancelling: $rst")
-      _ <- onClosed
-    } yield ()
+    state
+      .modify {
+        case s if s.state == StreamState.Closed => (s, None)
+        case s => (s.copy(state = StreamState.Closed), Some(s))
+      }
+      .flatMap {
+        case Some(s) =>
+          enqueue.offer(Chunk.singleton(rst)) >>
+            s.cancelWith(s"Sending RstStream, cancelling: $rst") >>
+            onClosed
+        case None => Applicative[F].unit
+      }
   }
 
   // Broadcast Frame
@@ -407,53 +415,73 @@ private[h2] class H2Stream[F[_]: Temporal](
   } yield ()
 
   def receiveRstStream(rst: H2Frame.RstStream): F[Unit] =
-    state.get.flatMap {
-      case s if s.state == StreamState.Closed => Applicative[F].unit
-      case s if s.state == StreamState.Idle => goAway(H2Error.ProtocolError)
-      case _ =>
-        for {
-          s <- state.modify(s => (s.copy(state = StreamState.Closed), s))
-          _ <- s.cancelWith(s"Received RstStream, cancelling: $rst")
-          _ <- onClosed
-        } yield ()
-    }
+    state
+      .modify {
+        case s if s.state == StreamState.Closed => (s, Right(None))
+        case s if s.state == StreamState.Idle => (s, Left(()))
+        case s => (s.copy(state = StreamState.Closed), Right(Some(s)))
+      }
+      .flatMap {
+        case Left(_) => goAway(H2Error.ProtocolError)
+        case Right(Some(s)) =>
+          s.cancelWith(s"Received RstStream, cancelling: $rst") >> onClosed
+        case Right(None) => Applicative[F].unit
+      }
 
   // Important for telling folks we can send more data
   def receiveWindowUpdate(window: H2Frame.WindowUpdate): F[Unit] =
-    state.get.flatMap { current =>
-      current.state match {
-        case StreamState.HalfClosedLocal | StreamState.Closed => Applicative[F].unit
-        case _ =>
-          for {
-            newWriteBlock <- Deferred[F, Either[Throwable, Unit]]
-            t <- state.modify { s =>
-              val oldSize = s.writeWindow
-              val newSize = oldSize.toLong + window.windowSizeIncrement.toLong
-              val sizeValid = s.writeWindow >= 0 && newSize <= Int.MaxValue
-              val newS = s.copy(writeBlock = newWriteBlock, writeWindow = newSize.toInt)
-              // println(s"Receive Window Update $newS - increment: ${window.windowSizeIncrement} oldSize: $oldSize")
-              (newS, (s.writeBlock, sizeValid))
-            }
-            (oldWriteBlock, valid) = t
-            _ <- {
-              if (!valid) rstStream(H2Error.FlowControlError)
-              else oldWriteBlock.complete(Either.unit).void
-            }
-          } yield ()
-      }
+    Deferred[F, Either[Throwable, Unit]].flatMap { newWriteBlock =>
+      state
+        .modify[WindowUpdateResult[F]] { s =>
+          s.state match {
+            case StreamState.HalfClosedLocal | StreamState.Closed =>
+              (s, WindowUpdateResult.Ignore())
+            case StreamState.Idle | StreamState.ReservedRemote =>
+              (s, WindowUpdateResult.ConnectionError())
+            case _ if window.windowSizeIncrement == 0 =>
+              (s, WindowUpdateResult.StreamError(H2Error.ProtocolError))
+            case _ =>
+              val newSize = s.writeWindow.toLong + window.windowSizeIncrement.toLong
+              if (newSize > Int.MaxValue)
+                (s, WindowUpdateResult.StreamError(H2Error.FlowControlError))
+              else
+                (
+                  s.copy(writeBlock = newWriteBlock, writeWindow = newSize.toInt),
+                  WindowUpdateResult.Updated(s.writeBlock),
+                )
+          }
+        }
+        .flatMap {
+          case WindowUpdateResult.Ignore() => Applicative[F].unit
+          case WindowUpdateResult.ConnectionError() => goAway(H2Error.ProtocolError)
+          case WindowUpdateResult.StreamError(error) => rstStream(error)
+          case WindowUpdateResult.Updated(oldWriteBlock) =>
+            oldWriteBlock.complete(Either.unit).void
+        }
     }
 
-  def modifyWriteWindow(amount: Int): F[Unit] = for {
-    newWriteBlock <- Deferred[F, Either[Throwable, Unit]]
-    oldWriteBlock <- state.modify { s =>
-      val newSize = s.writeWindow + amount
-      val newS = s.copy(writeBlock = newWriteBlock, writeWindow = newSize)
-      // println(s"Modify Write Window $newS")
-      (newS, s.writeBlock)
-    }
-
-    _ <- oldWriteBlock.complete(Either.unit).void
-  } yield ()
+  def modifyWriteWindow(amount: Int): F[Unit] =
+    if (amount == 0) Applicative[F].unit
+    else
+      for {
+        newWriteBlock <- Deferred[F, Either[Throwable, Unit]]
+        result <- state.modify { s =>
+          s.state match {
+            case StreamState.HalfClosedLocal | StreamState.ReservedRemote | StreamState.Closed =>
+              (s, Right(None))
+            case _ =>
+              val newSize = s.writeWindow.toLong + amount.toLong
+              if (newSize > Int.MaxValue || newSize < Int.MinValue)
+                (s, Left(H2Error.FlowControlError))
+              else
+                (
+                  s.copy(writeBlock = newWriteBlock, writeWindow = newSize.toInt),
+                  Right(Some(s.writeBlock)),
+                )
+          }
+        }
+        _ <- result.fold(goAway, _.traverse_(_.complete(Either.unit).void))
+      } yield ()
 
   def getRequest: F[org.http4s.Request[fs2.Pure]] = state.get.flatMap(_.request.get.rethrow)
   def getResponse: F[org.http4s.Response[fs2.Pure]] = state.get.flatMap(_.response.get.rethrow)
@@ -466,6 +494,15 @@ private[h2] class H2Stream[F[_]: Temporal](
 }
 
 private[h2] object H2Stream {
+  private sealed trait WindowUpdateResult[F[_]]
+  private object WindowUpdateResult {
+    final case class Ignore[F[_]]() extends WindowUpdateResult[F]
+    final case class ConnectionError[F[_]]() extends WindowUpdateResult[F]
+    final case class StreamError[F[_]](error: H2Error) extends WindowUpdateResult[F]
+    final case class Updated[F[_]](writeBlock: Deferred[F, Either[Throwable, Unit]])
+        extends WindowUpdateResult[F]
+  }
+
   final case class State[F[_]](
       state: StreamState,
       writeWindow: Int,

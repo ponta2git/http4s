@@ -29,6 +29,9 @@ import java.nio.charset.StandardCharsets
 private[h2] trait Hpack[F[_]] {
   def encodeHeaders(headers: NonEmptyList[(String, String, Boolean)]): F[ByteVector]
   def decodeHeaders(bv: ByteVector): F[NonEmptyList[(String, String)]]
+
+  /** Advances HPACK decoder state without materializing a field list. */
+  def decodeHeadersAndDiscard(bv: ByteVector): F[Unit]
 }
 
 private[h2] object Hpack extends HpackPlatform {
@@ -50,6 +53,8 @@ private[h2] object Hpack extends HpackPlatform {
       encodeLock.lock.surround(Hpack.encodeHeaders[F](tEncoder, headers.toList))
     def decodeHeaders(bv: ByteVector): F[NonEmptyList[(String, String)]] =
       decodeLock.lock.surround(Hpack.decodeHeaders[F](tDecoder, bv, maxHeaderListSize))
+    def decodeHeadersAndDiscard(bv: ByteVector): F[Unit] =
+      decodeLock.lock.surround(Hpack.decodeHeadersAndDiscard[F](tDecoder, bv, maxHeaderListSize))
 
   }
 
@@ -58,9 +63,32 @@ private[h2] object Hpack extends HpackPlatform {
       bv: ByteVector,
       maxHeaderListSize: Long,
   ): F[NonEmptyList[(String, String)]] = Sync[F].delay {
-    var decodedSize = 0L
     val buffer = List.newBuilder[(String, String)]
-    val is = bv.toInputStream
+    decodeHeaderBlock(tDecoder, bv, maxHeaderListSize) { (name, value) =>
+      buffer.+=(
+        new String(name, StandardCharsets.ISO_8859_1) -> new String(
+          value,
+          StandardCharsets.ISO_8859_1,
+        )
+      )
+    }
+    val decoded = buffer.result()
+    NonEmptyList.fromListUnsafe(decoded)
+  }
+
+  def decodeHeadersAndDiscard[F[_]: Sync](
+      tDecoder: Decoder,
+      bv: ByteVector,
+      maxHeaderListSize: Long,
+  ): F[Unit] =
+    Sync[F].delay(decodeHeaderBlock(tDecoder, bv, maxHeaderListSize)((_, _) => ()))
+
+  private def decodeHeaderBlock(
+      tDecoder: Decoder,
+      bv: ByteVector,
+      maxHeaderListSize: Long,
+  )(onHeader: (Array[Byte], Array[Byte]) => Unit): Unit = {
+    var decodedSize = 0L
     val listener = new HeaderListener {
       def addHeader(name: Array[Byte], value: Array[Byte], sensitive: Boolean): Unit = {
         // The HPACK decoder implementation does not track the 32 byte overhead, nor does it count
@@ -69,26 +97,14 @@ private[h2] object Hpack extends HpackPlatform {
         if (decodedSize > maxHeaderListSize) {
           throw EmberException.MessageTooLong(maxHeaderListSize.toInt)
         }
-
-        buffer.+=(
-          new String(name, StandardCharsets.ISO_8859_1) -> new String(
-            value,
-            StandardCharsets.ISO_8859_1,
-          )
-        )
-        ()
+        onHeader(name, value)
       }
     }
 
-    tDecoder.decode(is, listener)
-    val truncated = tDecoder.endHeaderBlock()
-
-    if (truncated) {
+    tDecoder.decode(bv.toInputStream, listener)
+    if (tDecoder.endHeaderBlock()) {
       throw EmberException.MessageTooLong(maxHeaderListSize.toInt)
     }
-
-    val decoded = buffer.result()
-    NonEmptyList.fromListUnsafe(decoded)
   }
 
   def encodeHeaders[F[_]: Sync](

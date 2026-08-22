@@ -25,6 +25,7 @@ import org.scalacheck.Arbitrary
 import org.scalacheck.Gen
 import org.scalacheck.effect.PropF.forAllF
 import org.typelevel.ci.CIString
+import scodec.bits.ByteVector
 
 class HpackSuite extends Http4sSuite {
 
@@ -57,6 +58,17 @@ class HpackSuite extends Http4sSuite {
         _ <- hpack.decodeHeaders(bv)
       } yield ()
     }
+  }
+
+  test("discarded headers update decoder state without requiring fields") {
+    for {
+      hpack <- Hpack.create[IO](65635)
+      first <- hpack.encodeHeaders(NonEmptyList.one(("x-dynamic", "value", false)))
+      second <- hpack.encodeHeaders(NonEmptyList.one(("x-dynamic", "value", false)))
+      _ <- hpack.decodeHeadersAndDiscard(ByteVector.empty)
+      _ <- hpack.decodeHeadersAndDiscard(first)
+      decoded <- hpack.decodeHeaders(second)
+    } yield assertEquals(decoded, NonEmptyList.one(("x-dynamic", "value")))
   }
 
 }

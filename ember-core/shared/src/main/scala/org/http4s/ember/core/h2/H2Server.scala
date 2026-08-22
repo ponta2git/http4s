@@ -202,7 +202,7 @@ private[ember] object H2Server {
       stateRef <- H2Connection.initState[F](
         initialRemoteSettings,
         defaultSettings.initialWindowSize,
-        localSettings.initialWindowSize,
+        defaultSettings.initialWindowSize,
       )
       queue <- cats.effect.std.Queue.bounded[F, Chunk[H2Frame]](128)
       hpack <- Hpack.create[F](
@@ -300,6 +300,12 @@ private[ember] object H2Server {
               _ <- fulfillPushPromises(resp)
               _ <- stream.sendMessageBody(resp) // Initial Resp Body
               _ <- stream.sendTrailerHeaders(resp)
+              _ <- stream.state.get.flatMap { streamState =>
+                // Keep half-closed streams addressable until the peer also closes its side.
+                h2.mapRef
+                  .update(_ - streamIx)
+                  .whenA(streamState.state == H2Stream.StreamState.Closed)
+              }
             } yield ()
 
           case false => stream.rstStream(H2Error.RefusedStream)

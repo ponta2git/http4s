@@ -63,9 +63,17 @@ private[ember] object H2Frame {
 
   object RawFrame {
 
+    private def decodePayloadLength(bv: ByteVector): Int =
+      (bv(2) & 0xff) | ((bv(1) & 0xff) << 8) | ((bv(0) & 0xff) << 16)
+
+    def payloadLength(bv: ByteVector): Option[Int] =
+      if (bv.length >= 3)
+        decodePayloadLength(bv).some
+      else None
+
     def fromByteVector(bv: ByteVector): Option[(RawFrame, ByteVector)] =
       if (bv.length >= 9) {
-        val length = (bv(2) & 0xff) | ((bv(1) & 0xff) << 8) | ((bv(0) & 0xff) << 16)
+        val length = decodePayloadLength(bv)
         if (bv.length >= 9 + length) {
           val `type` = bv(3)
           val flags = bv(4)
@@ -161,6 +169,10 @@ private[ember] object H2Frame {
   ) extends H2Frame {
     override def toString: String =
       s"Data(identifier=$identifier, data=$data, pad=$pad, endStream=$endStream)"
+
+    // The complete DATA payload, including Pad Length and Padding, consumes flow-control credit.
+    def flowControlledSize: Int =
+      data.size.toInt + pad.fold(0)(_.size.toInt + 1)
 
     def toRaw: RawFrame = Data.toRaw(this)
   }
