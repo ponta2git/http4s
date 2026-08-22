@@ -16,6 +16,7 @@
 
 package org.http4s.ember.core.h2
 
+import cats.data.NonEmptyList
 import cats.effect._
 import cats.effect.std.Queue
 import cats.effect.std.Semaphore
@@ -116,6 +117,11 @@ class H2ConnectionSuite extends Http4sSuite {
     H2Frame.Settings.ConnectionSettings.default
       .copy(maxHeaderListSize = Some(H2Frame.Settings.SettingsMaxHeaderListSize(maxHeaderListSize)))
 
+  private def frameBytes(frames: H2Frame*): ByteVector =
+    frames.foldLeft(ByteVector.empty) { case (acc, frame) =>
+      acc ++ H2Frame.toByteVector(frame)
+    }
+
   test("continunation frames within maxHeaderListSize accumulate without GoAway") {
     val headers =
       H2Frame.Headers(1, None, endStream = false, endHeaders = false, ByteVector.fill(40)(0), None)
@@ -147,5 +153,145 @@ class H2ConnectionSuite extends Http4sSuite {
       closed <- h2.state.get.map(_.closed)
       _ = assert(closed)
     } yield ()
+  }
+
+  test("late WindowUpdate for a closed stream is discarded") {
+    val input = frameBytes(H2Frame.WindowUpdate(1, 1), H2Frame.Ping.default)
+
+    for {
+      h2 <- mkConnection(H2Frame.Settings.ConnectionSettings.default, input)
+      _ <- h2.initiateRemoteStreamById(1)
+      _ <- h2.mapRef.update(_ - 1)
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield {
+      assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
+      assert(frames.contains(H2Frame.Ping.ack), clue(frames))
+    }
+  }
+
+  test("WindowUpdate for an idle stream still triggers GoAway") {
+    val input = frameBytes(H2Frame.WindowUpdate(1, 1))
+
+    for {
+      h2 <- mkConnection(H2Frame.Settings.ConnectionSettings.default, input)
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield assert(frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
+  }
+
+  test("zero stream WindowUpdate is a stream error") {
+    val input = frameBytes(H2Frame.WindowUpdate(1, 0), H2Frame.Ping.default)
+
+    for {
+      h2 <- mkConnection(H2Frame.Settings.ConnectionSettings.default, input)
+      stream <- h2.initiateRemoteStreamById(1)
+      _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Open))
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+      rst = frames.collectFirst { case r: H2Frame.RstStream => r }
+    } yield {
+      assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
+      assertEquals(rst.map(_.identifier), Some(1), clue(frames))
+      assertEquals(rst.map(_.value.toInt), Some(H2Error.ProtocolError.value), clue(frames))
+      assert(frames.contains(H2Frame.Ping.ack), clue(frames))
+    }
+  }
+
+  test("late DATA for a closed stream is discarded and counts against the connection window") {
+    val settings = H2Frame.Settings.ConnectionSettings.default.copy(
+      maxFrameSize = H2Frame.Settings.SettingsMaxFrameSize(65535)
+    )
+    val input = frameBytes(
+      H2Frame.Data(1, ByteVector.fill(40000)(0), None, endStream = false),
+      H2Frame.Ping.default,
+    )
+
+    for {
+      h2 <- mkConnection(settings, input)
+      _ <- h2.initiateRemoteStreamById(1)
+      _ <- h2.mapRef.update(_ - 1)
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+      connectionUpdate = frames.collectFirst { case w @ H2Frame.WindowUpdate(0, _) =>
+        w
+      }
+    } yield {
+      assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
+      assertEquals(connectionUpdate.map(_.windowSizeIncrement), Some(40000), clue(frames))
+      assert(frames.contains(H2Frame.Ping.ack), clue(frames))
+    }
+  }
+
+  test("late HEADERS for a closed stream update HPACK state and are discarded") {
+    val frames = for {
+      encoder <- Hpack.create[IO](1024)
+      headerBlock <- encoder.encodeHeaders(
+        NonEmptyList.of((":method", "GET", false), (":path", "/", false))
+      )
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(
+          H2Frame.Headers(1, None, endStream = true, endHeaders = true, headerBlock, None),
+          H2Frame.Ping.default,
+        ),
+      )
+      _ <- h2.initiateRemoteStreamById(1)
+      _ <- h2.mapRef.update(_ - 1)
+      _ <- h2.readLoop
+      outgoing <- drainOutgoing(h2)
+    } yield outgoing
+
+    frames.map { outgoing =>
+      assert(!outgoing.exists(_.isInstanceOf[H2Frame.GoAway]), clue(outgoing))
+      assert(outgoing.contains(H2Frame.Ping.ack), clue(outgoing))
+    }
+  }
+
+  test("late HEADERS continuation for a closed stream is minimally processed") {
+    val frames = for {
+      encoder <- Hpack.create[IO](1024)
+      headerBlock <- encoder.encodeHeaders(
+        NonEmptyList.of((":method", "GET", false), (":path", "/", false))
+      )
+      first = headerBlock.take(1)
+      rest = headerBlock.drop(1)
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(
+          H2Frame.Headers(1, None, endStream = true, endHeaders = false, first, None),
+          H2Frame.Continuation(1, endHeaders = true, rest),
+          H2Frame.Ping.default,
+        ),
+      )
+      _ <- h2.initiateRemoteStreamById(1)
+      _ <- h2.mapRef.update(_ - 1)
+      _ <- h2.readLoop
+      outgoing <- drainOutgoing(h2)
+    } yield outgoing
+
+    frames.map { outgoing =>
+      assert(!outgoing.exists(_.isInstanceOf[H2Frame.GoAway]), clue(outgoing))
+      assert(outgoing.contains(H2Frame.Ping.ack), clue(outgoing))
+    }
+  }
+
+  test("late RST_STREAM for a closed stream is discarded") {
+    val input = frameBytes(
+      H2Frame.RstStream(1, H2Error.Cancel.value),
+      H2Frame.Ping.default,
+    )
+
+    for {
+      h2 <- mkConnection(H2Frame.Settings.ConnectionSettings.default, input)
+      _ <- h2.initiateRemoteStreamById(1)
+      _ <- h2.mapRef.update(_ - 1)
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield {
+      assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
+      assert(!frames.exists(_.isInstanceOf[H2Frame.RstStream]), clue(frames))
+      assert(frames.contains(H2Frame.Ping.ack), clue(frames))
+    }
   }
 }

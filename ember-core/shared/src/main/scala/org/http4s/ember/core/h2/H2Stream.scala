@@ -380,8 +380,9 @@ private[h2] class H2Stream[F[_]: Temporal](
         } yield ()
       case StreamState.Idle =>
         goAway(H2Error.ProtocolError)
-      case StreamState.HalfClosedRemote | StreamState.Closed =>
+      case StreamState.HalfClosedRemote =>
         rstStream(H2Error.StreamClosed)
+      case StreamState.Closed => Applicative[F].unit
       case StreamState.ReservedLocal | StreamState.ReservedRemote =>
         goAway(H2Error.InternalError) // Not Implemented Push promise Support
     }
@@ -405,30 +406,42 @@ private[h2] class H2Stream[F[_]: Temporal](
     _ <- onClosed
   } yield ()
 
-  def receiveRstStream(rst: H2Frame.RstStream): F[Unit] = for {
-    s <- state.modify(s => (s.copy(state = StreamState.Closed), s))
-    _ <- s.cancelWith(s"Received RstStream, cancelling: $rst")
-    _ <- onClosed
-  } yield ()
+  def receiveRstStream(rst: H2Frame.RstStream): F[Unit] =
+    state.get.flatMap {
+      case s if s.state == StreamState.Closed => Applicative[F].unit
+      case s if s.state == StreamState.Idle => goAway(H2Error.ProtocolError)
+      case _ =>
+        for {
+          s <- state.modify(s => (s.copy(state = StreamState.Closed), s))
+          _ <- s.cancelWith(s"Received RstStream, cancelling: $rst")
+          _ <- onClosed
+        } yield ()
+    }
 
   // Important for telling folks we can send more data
-  def receiveWindowUpdate(window: H2Frame.WindowUpdate): F[Unit] = for {
-    newWriteBlock <- Deferred[F, Either[Throwable, Unit]]
-    t <- state.modify { s =>
-      val oldSize = s.writeWindow
-      val newSize = oldSize + window.windowSizeIncrement
-      val sizeValid = (s.writeWindow >= 0 && newSize >= 0) || s.writeWindow < 0 // Less than 2^31-1
-      val newS = s.copy(writeBlock = newWriteBlock, writeWindow = newSize)
-      // println(s"Receive Window Update $newS - increment: ${window.windowSizeIncrement} oldSize: $oldSize")
-      (newS, (s.writeBlock, sizeValid))
+  def receiveWindowUpdate(window: H2Frame.WindowUpdate): F[Unit] =
+    state.get.flatMap { current =>
+      current.state match {
+        case StreamState.HalfClosedLocal | StreamState.Closed => Applicative[F].unit
+        case _ =>
+          for {
+            newWriteBlock <- Deferred[F, Either[Throwable, Unit]]
+            t <- state.modify { s =>
+              val oldSize = s.writeWindow
+              val newSize = oldSize.toLong + window.windowSizeIncrement.toLong
+              val sizeValid = s.writeWindow >= 0 && newSize <= Int.MaxValue
+              val newS = s.copy(writeBlock = newWriteBlock, writeWindow = newSize.toInt)
+              // println(s"Receive Window Update $newS - increment: ${window.windowSizeIncrement} oldSize: $oldSize")
+              (newS, (s.writeBlock, sizeValid))
+            }
+            (oldWriteBlock, valid) = t
+            _ <- {
+              if (!valid) rstStream(H2Error.FlowControlError)
+              else oldWriteBlock.complete(Either.unit).void
+            }
+          } yield ()
+      }
     }
-    (oldWriteBlock, valid) = t
-
-    _ <- {
-      if (!valid) rstStream(H2Error.FlowControlError)
-      else oldWriteBlock.complete(Either.unit).void
-    }
-  } yield ()
 
   def modifyWriteWindow(amount: Int): F[Unit] = for {
     newWriteBlock <- Deferred[F, Either[Throwable, Unit]]

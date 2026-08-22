@@ -300,7 +300,6 @@ private[ember] object H2Server {
               _ <- fulfillPushPromises(resp)
               _ <- stream.sendMessageBody(resp) // Initial Resp Body
               _ <- stream.sendTrailerHeaders(resp)
-              _ <- h2.mapRef.update(_ - streamIx) // Remove stream from map on normal termination
             } yield ()
 
           case false => stream.rstStream(H2Error.RefusedStream)

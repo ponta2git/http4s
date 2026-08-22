@@ -381,4 +381,22 @@ class H2StreamSuite extends Http4sSuite {
       } yield assertEquals(stalled1, stalled0)
     }
   }
+
+  test("receiveWindowUpdate ignores updates after the local side has closed") {
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, _) = sq
+      _ <- stream.state.update(
+        _.copy(state = H2Stream.StreamState.HalfClosedLocal, writeWindow = 0)
+      )
+      _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 10))
+      halfClosed <- stream.state.get
+      _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Closed, writeWindow = 0))
+      _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 10))
+      closed <- stream.state.get
+    } yield {
+      assertEquals(halfClosed.writeWindow, 0)
+      assertEquals(closed.writeWindow, 0)
+    }
+  }
 }
