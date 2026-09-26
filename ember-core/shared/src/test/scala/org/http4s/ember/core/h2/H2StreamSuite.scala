@@ -538,10 +538,12 @@ class H2StreamSuite extends Http4sSuite {
         closed <- Ref[IO].of(0)
         sq <- streamAndQueue(defaultSettings, onClosed = closed.update(_ + 1))
         (stream, queue) = sq
-        _ <- stream.state.update(_.copy(
-          state = H2Stream.StreamState.HalfClosedLocal,
-          contentLengthCheck = Some((declaredLength, 0L)),
-        ))
+        _ <- stream.state.update(
+          _.copy(
+            state = H2Stream.StreamState.HalfClosedLocal,
+            contentLengthCheck = Some((declaredLength, 0L)),
+          )
+        )
         data = H2Frame.Data(1, ByteVector.fromValidHex("0001"), None, endStream = true)
         _ <- stream.receiveData(data)
         body <- stream.readBody.compile.toVector.attempt
@@ -623,15 +625,18 @@ class H2StreamSuite extends Http4sSuite {
           )
           (stream, queue) = sq
           block <- delegate.encodeHeaders(NonEmptyList.one((":status", "200", false)))
-          _ <- stream.receiveHeaders(
-            H2Frame.Headers(1, None, endStream = true, endHeaders = true, block, None),
-            Nil,
-          ).background.use { completed =>
-            entered.get >>
-              (if (reset) stream.rstStream(H2Error.Cancel)
-               else stream.sendData(ByteVector.empty, endStream = true)) >>
-              resume.complete(()) >> completed.flatMap(_.embedNever)
-          }
+          _ <- stream
+            .receiveHeaders(
+              H2Frame.Headers(1, None, endStream = true, endHeaders = true, block, None),
+              Nil,
+            )
+            .background
+            .use { completed =>
+              entered.get >>
+                (if (reset) stream.rstStream(H2Error.Cancel)
+                 else stream.sendData(ByteVector.empty, endStream = true)) >>
+                resume.complete(()) >> completed.flatMap(_.embedNever)
+            }
           response <- stream.getResponse.attempt.timeout(1.seconds)
           body <- stream.readBody.compile.toVector.attempt.timeout(1.seconds)
           frames <- drainFrames(queue)

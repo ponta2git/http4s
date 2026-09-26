@@ -823,9 +823,11 @@ class H2ConnectionSuite extends Http4sSuite {
         )
         _ <- h2.state.update(_.copy(writeWindow = 0))
         _ <- h2.writeLoop.compile.drain.background.use { completed =>
-          h2.outgoing.offer(Chunk.singleton(
-            H2Frame.Data(1, ByteVector.empty, Some(ByteVector.empty), endStream = true)
-          )) >> completed.void
+          h2.outgoing.offer(
+            Chunk.singleton(
+              H2Frame.Data(1, ByteVector.empty, Some(ByteVector.empty), endStream = true)
+            )
+          ) >> completed.void
         }
         st <- h2.state.get
         out <- writes.get
