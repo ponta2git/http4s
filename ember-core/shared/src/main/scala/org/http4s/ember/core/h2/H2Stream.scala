@@ -379,10 +379,30 @@ private[h2] class H2Stream[F[_]: Temporal](
       }
       .flatMap {
         case DataReceiveResult.Accepted(previous, isClosed, windowUpdate) =>
-          previous.readBuffer.send(Right(data.data)).void >>
-            windowUpdate.traverse_(increment =>
-              enqueue.offer(Chunk.singleton(H2Frame.WindowUpdate(id, increment)))
-            ) >>
+          previous.readBuffer
+            .trySend(Right(data.data))
+            .flatMap {
+              case Right(false) =>
+                // Closing a full Channel does not release a pending send without a consumer.
+                Temporal[F]
+                  .race(
+                    previous.readBuffer.send(Right(data.data)),
+                    previous.readBuffer.closed,
+                  )
+                  .map {
+                    case Left(Right(_)) => true
+                    case _ => false
+                  }
+              case Right(queued) => queued.pure[F]
+              case Left(_) => false.pure[F]
+            }
+            .flatMap { queued =>
+              windowUpdate
+                .traverse_(increment =>
+                  enqueue.offer(Chunk.singleton(H2Frame.WindowUpdate(id, increment)))
+                )
+                .whenA(queued)
+            } >>
             (previous.readBuffer.close *> previous.trailWith(List.empty).void)
               .whenA(data.endStream) >>
             onClosed.whenA(isClosed)
@@ -542,7 +562,7 @@ private[h2] object H2Stream {
       writeBlock.complete(ex) *>
         request.complete(ex) *>
         response.complete(ex) *>
-        readBuffer.send(ex) *>
+        readBuffer.closeWithElement(ex) *>
         trailers.complete(ex).void
     }
 

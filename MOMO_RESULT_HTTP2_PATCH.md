@@ -32,6 +32,13 @@ a stream even after SETTINGS reduces its send window below zero. Connection
 credit is reserved before a socket write and is independent of stream window
 settings.
 
+After sending a complete response, the server closes unconsumed request input.
+If the client has not ended the request, the server sends `RST_STREAM(NO_ERROR)`
+after the response's `END_STREAM`, as permitted by RFC 9113 section 8.1. Closing
+input releases a DATA receiver even when its bounded buffer is full; stream
+resets also complete without waiting for a body consumer. A client retains a
+completed response when it receives the subsequent `NO_ERROR` reset.
+
 ## Reproduce from source
 
 ```bash

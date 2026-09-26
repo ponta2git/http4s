@@ -206,11 +206,15 @@ private[ember] object H2Server {
               _ <- stream.sendMessageBody(resp) // Initial Resp Body
               _ <- stream.sendTrailerHeaders(resp)
               _ <- stream.state.get.flatMap { streamState =>
-                // Keep half-closed streams addressable until the peer also closes its side.
-                h2.mapRef
-                  .update(_ - streamIx)
-                  .whenA(streamState.state == H2Stream.StreamState.Closed)
+                // The response no longer owns a request body consumer. RFC 9113, section 8.1
+                // permits NO_ERROR after the complete response when the request is unfinished.
+                stream
+                  .rstStream(H2Error.NoError)
+                  .whenA(streamState.state == H2Stream.StreamState.HalfClosedLocal) >>
+                  // Final DATA may already have closed the stream while blocked on this buffer.
+                  streamState.readBuffer.close.void
               }
+              _ <- h2.mapRef.update(_ - streamIx)
             } yield ()
 
           case false => stream.rstStream(H2Error.RefusedStream)

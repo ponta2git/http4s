@@ -660,6 +660,76 @@ class H2StreamSuite extends Http4sSuite {
     }
   }
 
+  test("reset releases DATA waiting on a full body buffer and preserves its failure") {
+    TestControl.executeEmbed {
+      for {
+        closed <- Ref[IO].of(0)
+        sq <- streamAndQueue(defaultSettings, onClosed = closed.update(_ + 1))
+        (stream, queue) = sq
+        buffer <- Channel.bounded[IO, Either[Throwable, ByteVector]](128)
+        _ <- buffer.send(Right(ByteVector.empty)).replicateA_(128)
+        _ <- stream.state.update(_.copy(readBuffer = buffer, readWindow = 1))
+        _ <- stream
+          .receiveData(H2Frame.Data(1, ByteVector.fromValidHex("01"), None, endStream = false))
+          .background
+          .use { completed =>
+            // Let receiveData fill its stream window and block before resetting it.
+            IO.sleep(1.seconds) >> stream.rstStream(H2Error.Cancel).timeout(1.seconds) >>
+              completed.flatMap(_.embedNever).timeout(1.seconds)
+          }
+        _ <- buffer.closed.timeout(1.seconds)
+        body <- stream.readBody.compile.toVector.attempt.timeout(1.seconds)
+        frames <- drainFrames(queue)
+        count <- closed.get
+      } yield {
+        assert(body.isLeft, clue(body))
+        assertEquals(frames, Vector(H2Error.Cancel.toRst(1)))
+        assertEquals(count, 1)
+      }
+    }
+  }
+
+  List(false, true).foreach { requestEnded =>
+    test(s"NO_ERROR reset preserves a complete response with request ended $requestEnded") {
+      TestControl.executeEmbed {
+        for {
+          closed <- Ref[IO].of(0)
+          sq <- streamAndQueue(
+            defaultSettings,
+            H2Connection.ConnectionType.Client,
+            closed.update(_ + 1),
+          )
+          (stream, queue) = sq
+          _ <- stream.state.update(
+            _.copy(state =
+              if (requestEnded) H2Stream.StreamState.HalfClosedLocal else H2Stream.StreamState.Open
+            )
+          )
+          block <- stream.hpack.encodeHeaders(
+            NonEmptyList.of((":status", "200", false), ("content-length", "2", false))
+          )
+          _ <- stream.receiveHeaders(
+            H2Frame.Headers(1, None, endStream = false, endHeaders = true, block, None),
+            Nil,
+          )
+          _ <- stream.receiveData(
+            H2Frame.Data(1, ByteVector.fromValidHex("0001"), None, endStream = true)
+          )
+          _ <- stream.receiveRstStream(H2Error.NoError.toRst(1))
+          response <- stream.getResponse.timeout(1.seconds)
+          body <- stream.readBody.compile.toVector.timeout(1.seconds)
+          frames <- drainFrames(queue)
+          count <- closed.get
+        } yield {
+          assertEquals(response.status, Status.Ok)
+          assertEquals(body, Vector[Byte](0, 1))
+          assertEquals(frames, Vector.empty)
+          assertEquals(count, 1)
+        }
+      }
+    }
+  }
+
   private def drainFrames(queue: Queue[IO, Chunk[H2Frame]]): IO[Vector[H2Frame]] =
     queue.tryTake.flatMap {
       case Some(chunk) => drainFrames(queue).map(chunk.toVector ++ _)
