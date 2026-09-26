@@ -85,6 +85,7 @@ lazy val root = tlCrossRootProject
 lazy val core = libraryCrossProject("core")
   .enablePlugins(BuildInfoPlugin)
   .jvmEnablePlugins(MimeLoaderPlugin)
+  .settings(mavenMetadataSettings)
   .settings(
     description := "Core http4s library for servers and clients",
     startYear := Some(2013),
@@ -269,6 +270,7 @@ lazy val tests = libraryCrossProject("tests")
   .dependsOn(core, laws)
 
 lazy val server = libraryCrossProject("server")
+  .settings(mavenMetadataSettings)
   .settings(
     description := "Base library for building http4s servers",
     startYear := Some(2014),
@@ -441,6 +443,7 @@ lazy val clientTestkit = libraryCrossProject("client-testkit")
   .dependsOn(client, theDsl, server, tests % Test)
 
 lazy val emberCore = libraryCrossProject("ember-core", CrossType.Full)
+  .settings(mavenMetadataSettings)
   .settings(
     description := "Base library for ember http4s clients and servers",
     startYear := Some(2019),
@@ -653,6 +656,7 @@ lazy val emberCore = libraryCrossProject("ember-core", CrossType.Full)
   .dependsOn(core, tests % Test)
 
 lazy val emberServer = libraryCrossProject("ember-server")
+  .settings(mavenMetadataSettings)
   .settings(
     description := "ember implementation for http4s servers",
     startYear := Some(2019),
@@ -981,6 +985,29 @@ def exampleProject(name: String) =
     .enablePlugins(NoPublishPlugin)
     .settings(libraryDependencies += logbackClassic % Runtime)
     .dependsOn(examples)
+
+// Use the published POM's coordinates, including Scala and platform suffixes, so scanners
+// can identify fork artifacts without a Maven Central checksum match. Generate at packaging
+// time: source/resource generation must not depend on publication metadata.
+lazy val mavenMetadataSettings = Seq(
+  Compile / packageBin / mappings ++= {
+    val pomFile = makePom.value
+    val pom = scala.xml.XML.loadFile(pomFile)
+    val groupId = (pom \ "groupId").text
+    val artifactId = (pom \ "artifactId").text
+    val artifactVersion = (pom \ "version").text
+    val metadataPath = s"META-INF/maven/$groupId/$artifactId"
+    val propertiesFile = (Compile / crossTarget).value / "maven-metadata" / "pom.properties"
+    IO.write(
+      propertiesFile,
+      s"groupId=$groupId\nartifactId=$artifactId\nversion=$artifactVersion\n",
+    )
+    Seq(
+      propertiesFile -> s"$metadataPath/pom.properties",
+      pomFile -> s"$metadataPath/pom.xml",
+    )
+  }
+)
 
 lazy val commonSettings = Seq(
   libraryDependencies ++= Seq(
