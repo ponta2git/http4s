@@ -14,6 +14,11 @@ The patch is not an official http4s release. Consumers should use the fixed
 commit SHA, rather than the moving branch. The historical
 `momo-h2-rfc-v02336` tag remains the previous patch version.
 
+Fork versions include the upstream base and source commit:
+`0.23.37-momo-<commit-prefix>-SNAPSHOT`. Clean clones produce the same version
+without mirroring upstream release tags or triggering their release workflows.
+Dirty checkouts include a timestamp and must not be used for pinned builds.
+
 The patch preserves late closed-stream frame handling, HPACK synchronization,
 stream state validation, and connection/stream flow control. It includes the
 upstream 0.23.37 frame/header size limits and HTTP/2 idle/stall timeouts.

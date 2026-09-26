@@ -41,7 +41,7 @@ import scala.concurrent.duration.DurationLong
 class H2StreamSuite extends Http4sSuite {
   val defaultSettings = H2Frame.Settings.ConnectionSettings.default
 
-  def streamAndQueue(
+  private def streamAndQueue(
       config: H2Frame.Settings.ConnectionSettings,
       connectionType: H2Connection.ConnectionType = H2Connection.ConnectionType.Server,
       onClosed: IO[Unit] = IO.unit,

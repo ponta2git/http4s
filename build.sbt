@@ -8,6 +8,15 @@ import scala.xml.transform.{RewriteRule, RuleTransformer}
 ThisBuild / crossScalaVersions := Seq(scala_3, scala_212, scala_213)
 ThisBuild / tlBspCrossProjectPlatforms := Set(JVMPlatform)
 ThisBuild / tlBaseVersion := "0.23"
+// Do not require mirroring upstream v* tags, which would run their release workflow.
+ThisBuild / version := {
+  val sha = git.gitHeadCommit.value.getOrElse(sys.error("Fork builds require a Git checkout"))
+  val dirty =
+    if (git.gitUncommittedChanges.value) s"-${java.time.Instant.now().getEpochSecond}" else ""
+  s"${tlBaseVersion.value}.37-momo-${sha.take(12)}$dirty-SNAPSHOT"
+}
+ThisBuild / isSnapshot := true
+ThisBuild / tlMimaPreviousVersions += "0.23.37"
 ThisBuild / developers += tlGitHubDev("rossabaker", "Ross A. Baker")
 
 ThisBuild / tlCiReleaseBranches := Seq("series/0.23")
