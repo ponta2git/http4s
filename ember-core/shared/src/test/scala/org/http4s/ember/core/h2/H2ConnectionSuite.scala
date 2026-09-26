@@ -79,6 +79,7 @@ class H2ConnectionSuite extends Http4sSuite {
       input: ByteVector,
       connectionType: H2Connection.ConnectionType = H2Connection.ConnectionType.Server,
       socketOverride: Option[Socket[IO]] = None,
+      idleTimeout: Duration = Duration.Inf,
   ): IO[H2Connection[IO]] =
     for {
       socket <- socketOverride.fold(readOnlySocket(input))(_.pure[IO])
@@ -101,7 +102,7 @@ class H2ConnectionSuite extends Http4sSuite {
       addr,
       connectionType,
       Duration.Inf,
-      Duration.Inf,
+      idleTimeout,
       localSettings,
       mapRef,
       stateRef,
@@ -115,6 +116,40 @@ class H2ConnectionSuite extends Http4sSuite {
       socket,
       logger,
     )
+
+  private def mkConnection(
+      localSettings: H2Frame.Settings.ConnectionSettings,
+      input: ByteVector,
+      idleTimeout: Duration,
+      writes: Ref[IO, ByteVector],
+  ): IO[H2Connection[IO]] =
+    testSocket(input, bytes => writes.update(_ ++ bytes.toByteVector)).flatMap { socket =>
+      mkConnection(localSettings, input, socketOverride = Some(socket), idleTimeout = idleTimeout)
+    }
+
+  private def decodeFrames(bv: ByteVector): Vector[H2Frame] = {
+    @annotation.tailrec
+    def go(rest: ByteVector, acc: Vector[H2Frame]): Vector[H2Frame] =
+      H2Frame.RawFrame.fromByteVector(rest) match {
+        case Some((raw, tail)) =>
+          H2Frame.fromRaw(raw) match {
+            case Right(frame) => go(tail, acc :+ frame)
+            case Left(_) => acc
+          }
+        case None => acc
+      }
+    go(bv, Vector.empty)
+  }
+
+  private def dataFrame(size: Int): Chunk[H2Frame] =
+    Chunk.singleton(H2Frame.Data(1, ByteVector.fill(size.toLong)(0), None, endStream = false))
+
+  private def increaseWindowSize(h2: H2Connection[IO], size: Int): IO[Unit] =
+    Deferred[IO, Either[Throwable, Unit]].flatMap { next =>
+      h2.state
+        .modify(s => (s.copy(writeBlock = next, writeWindow = s.writeWindow + size), s.writeBlock))
+        .flatMap(_.complete(Right(())).void)
+    }
 
   private def drainOutgoing(h2: H2Connection[IO]): IO[Vector[H2Frame]] =
     h2.outgoing.tryTake.flatMap {
@@ -574,5 +609,300 @@ class H2ConnectionSuite extends Http4sSuite {
       assert(!outgoing.exists(_.isInstanceOf[H2Frame.RstStream]), clue(outgoing))
       assert(outgoing.contains(H2Frame.Ping.ack), clue(outgoing))
     }
+  }
+
+  test("data for a stream that has already been answered is ignored") {
+    val data = H2Frame.Data(1, ByteVector.empty, None, endStream = true)
+    for {
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        H2Frame.toByteVector(data),
+      )
+      _ <- h2.initiateRemoteStreamById(1)
+      _ <- h2.mapRef.set(Map.empty)
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+      _ = assert(
+        !frames.exists(_.isInstanceOf[H2Frame.GoAway]),
+        clue(
+          s"a peer that sends END_STREAM after we have answered and dropped the " +
+            s"stream must not take the whole connection down, got $frames"
+        ),
+      )
+    } yield ()
+  }
+
+  test("terminal continuation frame exceeding maxHeaderListSize triggers GoAway(EnhanceYourCalm)") {
+    // small HEADERS (endHeaders=false), then a large terminal CONTINUATION (endHeaders=true)
+    val headers =
+      H2Frame.Headers(1, None, endStream = false, endHeaders = false, ByteVector.fill(10)(0), None)
+    val cont = H2Frame.Continuation(1, endHeaders = true, ByteVector.fill(200)(0))
+    val input = H2Frame.toByteVector(headers) ++ H2Frame.toByteVector(cont)
+    for {
+      // 10 + 200 = 210 > 100
+      h2 <- mkConnection(settingsWithMaxHeaderListSize(100), input)
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+      goAway = frames.collectFirst { case g: H2Frame.GoAway => g }
+      _ = assert(goAway.nonEmpty, clue(frames))
+      _ = assertEquals(goAway.get.errorCode.toInt, H2Error.EnhanceYourCalm.value)
+      closed <- h2.state.get.map(_.closed)
+      _ = assert(closed)
+    } yield ()
+  }
+
+  test("terminal continuation frame within maxHeaderListSize does not GoAway on size") {
+    val headers =
+      H2Frame.Headers(1, None, endStream = false, endHeaders = false, ByteVector.fill(10)(0), None)
+    val cont = H2Frame.Continuation(1, endHeaders = true, ByteVector.fill(30)(0))
+    val input = H2Frame.toByteVector(headers) ++ H2Frame.toByteVector(cont)
+    for {
+      // 10 + 30 <= 100; will fail HPACK decode but must not GoAway(EnhanceYourCalm)
+      h2 <- mkConnection(settingsWithMaxHeaderListSize(100), input)
+      _ <- h2.readLoop.attempt
+      frames <- drainOutgoing(h2)
+      _ = assert(
+        !frames
+          .collect { case g: H2Frame.GoAway => g }
+          .exists(_.errorCode.toInt == H2Error.EnhanceYourCalm.value),
+        clue(frames),
+      )
+    } yield ()
+  }
+
+  test("connection write stall past idleTimeout emits GoAway and closes") {
+    val idle = 1.second
+    TestControl.executeEmbed(
+      for {
+        writes <- Ref[IO].of(ByteVector.empty)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          idle,
+          writes,
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        loop <- h2.writeLoop.compile.drain.start
+        _ <- h2.outgoing.offer(dataFrame(16))
+        _ <- loop.join
+        st <- h2.state.get
+        out <- writes.get
+        frames = decodeFrames(out)
+      } yield {
+        assert(st.closed, clue(st.closed))
+        assertEquals(
+          frames.collectFirst { case g: H2Frame.GoAway => g.errorCode.toInt },
+          Some(H2Error.ProtocolError.value),
+          clue(frames),
+        )
+      }
+    )
+  }
+
+  test("connection write stall resolved by a window update does not GoAway") {
+    val idle = 1.second
+    TestControl.executeEmbed(
+      for {
+        writes <- Ref[IO].of(ByteVector.empty)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          idle,
+          writes,
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        loop <- h2.writeLoop.compile.drain.start
+        _ <- h2.outgoing.offer(dataFrame(16))
+        _ <- IO.sleep(idle / 2)
+        _ <- increaseWindowSize(h2, 1 << 20)
+        _ <- IO.sleep(idle)
+        st <- h2.state.get
+        _ <- loop.cancel
+        out <- writes.get
+        frames = decodeFrames(out)
+      } yield {
+        assert(!st.closed, clue(st.closed))
+        assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
+        assertEquals(frames.collect { case d: H2Frame.Data => d.data.size }, Vector(16L))
+      }
+    )
+  }
+
+  test("idle time between writes does not consume the stall budget") {
+    val idle = 1.second
+    TestControl.executeEmbed(
+      for {
+        writes <- Ref[IO].of(ByteVector.empty)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          idle,
+          writes,
+        )
+        loop <- h2.writeLoop.compile.drain.start
+        _ <- h2.outgoing.offer(dataFrame(16))
+        _ <- IO.sleep(idle * 10)
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        _ <- h2.outgoing.offer(dataFrame(16))
+        _ <- IO.sleep(idle / 2)
+        midway <- h2.state.get
+        _ <- increaseWindowSize(h2, 1 << 20)
+        _ <- IO.sleep(idle / 2)
+        st <- h2.state.get
+        _ <- loop.cancel
+        out <- writes.get
+        frames = decodeFrames(out)
+      } yield {
+        assert(!midway.closed, "connection closed before its stall budget elapsed")
+        assert(!st.closed, clue(st.closed))
+        assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
+      }
+    )
+  }
+
+  test("a control frame does not trigger a stall") {
+    val idle = 1.second
+    TestControl.executeEmbed(
+      for {
+        writes <- Ref[IO].of(ByteVector.empty)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          idle,
+          writes,
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        loop <- h2.writeLoop.compile.drain.start
+        _ <- h2.outgoing.offer(Chunk.singleton(H2Frame.Ping.ack))
+        _ <- IO.sleep(idle * 10)
+        _ <- loop.cancel
+        st <- h2.state.get
+        out <- writes.get
+        frames = decodeFrames(out)
+      } yield {
+        assert(frames.exists(_.isInstanceOf[H2Frame.Ping]), clue(frames))
+        assert(!st.closed, clue(st.closed))
+      }
+    )
+  }
+
+  test("an empty unpadded DATA frame at zero credit does not start an idle stall") {
+    TestControl.executeEmbed {
+      for {
+        writes <- Ref[IO].of(ByteVector.empty)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          1.second,
+          writes,
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        expected = H2Frame.Data(1, ByteVector.empty, None, endStream = true)
+        st <- h2.writeLoop.compile.drain.background.use { _ =>
+          h2.outgoing.offer(Chunk.singleton(expected)) >> IO.sleep(10.seconds) >> h2.state.get
+        }
+        out <- writes.get
+      } yield {
+        assert(!st.closed)
+        assertEquals(st.writeWindow, 0)
+        assertEquals(st.stallStart, None)
+        assertEquals(decodeFrames(out), Vector(expected))
+      }
+    }
+  }
+
+  test("padding-only DATA at zero credit is bounded by the connection stall timeout") {
+    TestControl.executeEmbed {
+      for {
+        writes <- Ref[IO].of(ByteVector.empty)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          1.second,
+          writes,
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        _ <- h2.writeLoop.compile.drain.background.use { completed =>
+          h2.outgoing.offer(Chunk.singleton(
+            H2Frame.Data(1, ByteVector.empty, Some(ByteVector.empty), endStream = true)
+          )) >> completed.void
+        }
+        st <- h2.state.get
+        out <- writes.get
+        frames = decodeFrames(out)
+      } yield {
+        assert(st.closed)
+        assertEquals(st.writeWindow, 0)
+        assert(!frames.exists(_.isInstanceOf[H2Frame.Data]), clue(frames))
+        assertEquals(
+          frames.collectFirst { case goAway: H2Frame.GoAway => goAway.errorCode.toInt },
+          Some(H2Error.ProtocolError.value),
+        )
+      }
+    }
+  }
+
+  test("an in-flight socket write reserves connection credit before peer WINDOW_UPDATE") {
+    TestControl.executeEmbed {
+      for {
+        writing <- Deferred[IO, Unit]
+        release <- Deferred[IO, Unit]
+        input = frameBytes(H2Frame.WindowUpdate(0, 1))
+        socket <- testSocket(input, _ => writing.complete(()).void >> release.get)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          input,
+          socketOverride = Some(socket),
+          idleTimeout = 1.second,
+        )
+        _ <- h2.state.update(_.copy(writeWindow = Int.MaxValue))
+        frames <- h2.writeLoop.compile.drain.background.use { _ =>
+          h2.outgoing.offer(dataFrame(1)) >> writing.get >> h2.readLoop >> drainOutgoing(h2)
+        }
+        st <- h2.state.get
+      } yield {
+        assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]), clue(frames))
+        assertEquals(st.writeWindow, Int.MaxValue)
+      }
+    }
+  }
+
+  test("a terminal continuation on closed HEADERS cannot bypass the header block budget") {
+    val input = frameBytes(
+      H2Frame.Headers(1, None, endStream = true, endHeaders = false, ByteVector.fill(60)(0), None),
+      H2Frame.Continuation(1, endHeaders = true, ByteVector.fill(60)(0)),
+    )
+    for {
+      h2 <- mkConnection(settingsWithMaxHeaderListSize(100), input)
+      _ <- h2.initiateRemoteStreamById(1)
+      _ <- h2.mapRef.update(_ - 1)
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield assertEquals(
+      frames.collectFirst { case goAway: H2Frame.GoAway => goAway.errorCode.toInt },
+      Some(H2Error.EnhanceYourCalm.value),
+    )
+  }
+
+  test("PUSH_PROMISE terminal continuation uses the origin ID and enforces the header budget") {
+    val input = frameBytes(
+      H2Frame.PushPromise(1, endHeaders = false, 2, ByteVector.fill(60)(0), None),
+      H2Frame.Continuation(1, endHeaders = true, ByteVector.fill(60)(0)),
+    )
+    for {
+      h2 <- mkConnection(
+        settingsWithMaxHeaderListSize(100),
+        input,
+        H2Connection.ConnectionType.Client,
+      )
+      source <- h2.initiateLocalStream
+      _ <- source.state.update(_.copy(state = H2Stream.StreamState.Closed))
+      _ <- h2.mapRef.update(_ - source.id)
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield assertEquals(
+      frames.collectFirst { case goAway: H2Frame.GoAway => goAway.errorCode.toInt },
+      Some(H2Error.EnhanceYourCalm.value),
+    )
   }
 }

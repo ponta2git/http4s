@@ -42,7 +42,10 @@ class H2StreamSuite extends Http4sSuite {
   val defaultSettings = H2Frame.Settings.ConnectionSettings.default
 
   def streamAndQueue(
-      config: H2Frame.Settings.ConnectionSettings
+      config: H2Frame.Settings.ConnectionSettings,
+      connectionType: H2Connection.ConnectionType = H2Connection.ConnectionType.Server,
+      onClosed: IO[Unit] = IO.unit,
+      hpackOverride: Option[Hpack[IO]] = None,
   ): IO[(H2Stream[IO], Queue[IO, Chunk[H2Frame]])] =
     for {
       writeBlock <- Deferred[IO, Either[Throwable, Unit]]
@@ -65,19 +68,19 @@ class H2StreamSuite extends Http4sSuite {
           stallStart = None,
         )
       )
-      hpack <- Hpack.create[IO](1024)
+      hpack <- hpackOverride.fold(Hpack.create[IO](1024))(IO.pure)
       logger <- log4cats.noop.NoOpFactory[IO].fromClass(classOf[H2StreamSuite])
       outgoing <- Queue.unbounded[IO, Chunk[H2Frame]]
       stream = new H2Stream[IO](
         1,
         60.seconds,
         defaultSettings,
-        H2Connection.ConnectionType.Server,
+        connectionType,
         IO.pure(config),
         state,
         hpack,
         outgoing,
-        IO.unit,
+        onClosed,
         _ => IO.unit,
         logger,
       )
@@ -488,4 +491,173 @@ class H2StreamSuite extends Http4sSuite {
       outgoing <- queue.tryTake
     } yield assertEquals(outgoing, None)
   }
+
+  test("sendData can end an empty stream after SETTINGS makes its window negative") {
+    TestControl.executeEmbed {
+      for {
+        sq <- streamAndQueue(defaultSettings)
+        (stream, queue) = sq
+        _ <- stream.state.update(_.copy(writeWindow = -10))
+        _ <- stream.sendData(ByteVector.empty, endStream = true).timeout(1.seconds)
+        frames <- drainFrames(queue)
+        updated <- stream.state.get
+      } yield {
+        assertEquals(frames, Vector(H2Frame.Data(1, ByteVector.empty, None, endStream = true)))
+        assertEquals(updated.writeWindow, -10)
+        assertEquals(updated.state, H2Stream.StreamState.HalfClosedLocal)
+      }
+    }
+  }
+
+  test("empty nonterminal DATA waits for credit when the stream window is negative") {
+    TestControl.executeEmbed {
+      for {
+        sq <- streamAndQueue(defaultSettings)
+        (stream, queue) = sq
+        _ <- stream.state.update(_.copy(writeWindow = -10))
+        sentBeforeUpdate <- stream.sendData(ByteVector.empty, endStream = false).background.use {
+          completed =>
+            for {
+              _ <- IO.sleep(1.seconds)
+              premature <- queue.tryTake
+              _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 11))
+              _ <- completed.flatMap(_.embedNever)
+            } yield premature
+        }
+        frames <- drainFrames(queue)
+      } yield {
+        assertEquals(sentBeforeUpdate, None)
+        assertEquals(frames, Vector(H2Frame.Data(1, ByteVector.empty, None, endStream = false)))
+      }
+    }
+  }
+
+  List(2L, 3L).foreach { declaredLength =>
+    test(s"final DATA checks content-length $declaredLength before closing the local half") {
+      for {
+        closed <- Ref[IO].of(0)
+        sq <- streamAndQueue(defaultSettings, onClosed = closed.update(_ + 1))
+        (stream, queue) = sq
+        _ <- stream.state.update(_.copy(
+          state = H2Stream.StreamState.HalfClosedLocal,
+          contentLengthCheck = Some((declaredLength, 0L)),
+        ))
+        data = H2Frame.Data(1, ByteVector.fromValidHex("0001"), None, endStream = true)
+        _ <- stream.receiveData(data)
+        body <- stream.readBody.compile.toVector.attempt
+        _ <- stream.receiveData(data)
+        _ <- stream.rstStream(H2Error.ProtocolError)
+        frames <- drainFrames(queue)
+        state <- stream.state.get
+        count <- closed.get
+      } yield {
+        val resets = frames.collect { case rst: H2Frame.RstStream => rst.value.toInt }
+        if (declaredLength == 2L) {
+          assertEquals(body, Right(Vector[Byte](0, 1)))
+          assertEquals(resets, Vector.empty)
+        } else {
+          assert(body.isLeft, clue(body))
+          assertEquals(resets, Vector(H2Error.ProtocolError.value))
+        }
+        assertEquals(state.state, H2Stream.StreamState.Closed)
+        assertEquals(count, 1)
+      }
+    }
+  }
+
+  test("invalid terminal response HEADERS reset and complete waiters before closing") {
+    TestControl.executeEmbed {
+      for {
+        closed <- Ref[IO].of(0)
+        sq <- streamAndQueue(
+          defaultSettings,
+          H2Connection.ConnectionType.Client,
+          closed.update(_ + 1),
+        )
+        (stream, queue) = sq
+        _ <- stream.state.update(_.copy(state = H2Stream.StreamState.HalfClosedLocal))
+        block <- stream.hpack.encodeHeaders(NonEmptyList.one(("x-not-status", "value", false)))
+        _ <- stream.receiveHeaders(
+          H2Frame.Headers(1, None, endStream = true, endHeaders = true, block, None),
+          Nil,
+        )
+        response <- stream.getResponse.attempt.timeout(1.seconds)
+        body <- stream.readBody.compile.toVector.attempt.timeout(1.seconds)
+        _ <- stream.rstStream(H2Error.ProtocolError)
+        frames <- drainFrames(queue)
+        count <- closed.get
+      } yield {
+        assert(response.isLeft, clue(response))
+        assert(body.isLeft, clue(body))
+        assertEquals(
+          frames.collect { case rst: H2Frame.RstStream => rst.value.toInt },
+          Vector(H2Error.ProtocolError.value),
+        )
+        assertEquals(count, 1)
+      }
+    }
+  }
+
+  List(false, true).foreach { reset =>
+    val action = if (reset) "reset" else "local END_STREAM"
+    test(s"remote header decode cannot undo $action while it is suspended") {
+      TestControl.executeEmbed {
+        for {
+          entered <- Deferred[IO, Unit]
+          resume <- Deferred[IO, Unit]
+          delegate <- Hpack.create[IO](1024)
+          gated = new Hpack[IO] {
+            def encodeHeaders(headers: NonEmptyList[(String, String, Boolean)]): IO[ByteVector] =
+              delegate.encodeHeaders(headers)
+            def decodeHeaders(bytes: ByteVector): IO[NonEmptyList[(String, String)]] =
+              entered.complete(()).void >> resume.get >> delegate.decodeHeaders(bytes)
+            def decodeHeadersAndDiscard(bytes: ByteVector): IO[Unit] =
+              delegate.decodeHeadersAndDiscard(bytes)
+          }
+          closed <- Ref[IO].of(0)
+          sq <- streamAndQueue(
+            defaultSettings,
+            H2Connection.ConnectionType.Client,
+            closed.update(_ + 1),
+            Some(gated),
+          )
+          (stream, queue) = sq
+          block <- delegate.encodeHeaders(NonEmptyList.one((":status", "200", false)))
+          _ <- stream.receiveHeaders(
+            H2Frame.Headers(1, None, endStream = true, endHeaders = true, block, None),
+            Nil,
+          ).background.use { completed =>
+            entered.get >>
+              (if (reset) stream.rstStream(H2Error.Cancel)
+               else stream.sendData(ByteVector.empty, endStream = true)) >>
+              resume.complete(()) >> completed.flatMap(_.embedNever)
+          }
+          response <- stream.getResponse.attempt.timeout(1.seconds)
+          body <- stream.readBody.compile.toVector.attempt.timeout(1.seconds)
+          frames <- drainFrames(queue)
+          state <- stream.state.get
+          count <- closed.get
+        } yield {
+          assertEquals(state.state, H2Stream.StreamState.Closed)
+          assertEquals(count, 1)
+          val resets = frames.collect { case rst: H2Frame.RstStream => rst.value.toInt }
+          if (reset) {
+            assert(response.isLeft, clue(response))
+            assert(body.isLeft, clue(body))
+            assertEquals(resets, Vector(H2Error.Cancel.value))
+          } else {
+            assertEquals(response.map(_.status), Right(Status.Ok))
+            assertEquals(body, Right(Vector.empty[Byte]))
+            assertEquals(resets, Vector.empty)
+          }
+        }
+      }
+    }
+  }
+
+  private def drainFrames(queue: Queue[IO, Chunk[H2Frame]]): IO[Vector[H2Frame]] =
+    queue.tryTake.flatMap {
+      case Some(chunk) => drainFrames(queue).map(chunk.toVector ++ _)
+      case None => IO.pure(Vector.empty)
+    }
 }

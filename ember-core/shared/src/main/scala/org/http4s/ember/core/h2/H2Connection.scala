@@ -65,6 +65,24 @@ private[h2] class H2Connection[F[_]](
   private[this] val initialConnectionWindowSize: Int =
     H2Frame.Settings.ConnectionSettings.default.initialWindowSize.windowSize
 
+  private[this] val readIdleTimeout: Duration = connectionType match {
+    case H2Connection.ConnectionType.Server => idleTimeout
+    case H2Connection.ConnectionType.Client => Duration.Inf
+  }
+
+  /** Whether some stream leaves the peer nothing to send, so silence from it is
+    * a peer waiting on us rather than an idle connection.
+    */
+  private[this] def peerAwaitingResponse: F[Boolean] =
+    mapRef.get
+      .flatMap(_.values.toList.traverse(_.state.get.map(_.state)))
+      .map(_.exists {
+        case H2Stream.StreamState.Idle | H2Stream.StreamState.ReservedLocal |
+            H2Stream.StreamState.HalfClosedRemote =>
+          true
+        case _ => false
+      })
+
   // An unauthenticated peer can open streams without limit.  The 4x
   // gives us slack to reap the closed streams in a graceful fashion,
   // while giving a hard upper bound to protect the server or client
@@ -235,6 +253,40 @@ private[h2] class H2Connection[F[_]](
       }
 
   private[this] def writeChunk(chunk: Chunk[H2Frame]): F[Unit] = {
+    def withStallTimeout[A](fa: F[A]): F[A] =
+      Temporal[F].monotonic
+        .flatMap { now =>
+          state.modify { st =>
+            val start = st.stallStart.getOrElse(now)
+            (st.copy(stallStart = Some(start)), now - start)
+          }
+        }
+        .flatMap { elapsed =>
+          val remaining = idleTimeout - elapsed
+          if (remaining <= Duration.Zero)
+            logger.debug(s"connection stall timeout exceeded ($elapsed)") >>
+              goAwayImmediately(H2Error.ProtocolError)
+          else
+            Temporal[F].timeoutTo(
+              fa,
+              remaining,
+              logger.debug(s"stream stall timeout exceeded") >>
+                goAwayImmediately(H2Error.ProtocolError),
+            )
+        }
+
+    // Terminate the connection during a write stall. In this case, the `outgoing` queue isn't
+    // progressing and will stay stuck waiting to send the go away message, so push it out directly.
+    def goAwayImmediately[A](error: H2Error): F[A] =
+      state.get.map(_.remoteHighestStream).flatMap { i =>
+        // Last-ditch timeout in case TCP layer is stalled.
+        Temporal[F].timeout(
+          socket.write(Chunk.byteVector(H2Frame.toByteVector(error.toGoAway(i)))),
+          idleTimeout,
+        )
+      } >> state.update(_.copy(closed = true)) >>
+        H2Connection.KillWithoutMessage().raiseError
+
     def go(chunk: Chunk[H2Frame]): F[Unit] = state.get.flatMap { s =>
       val fullDataSize = chunk.foldLeft(0L) {
         case (init, data: H2Frame.Data) => init + data.flowControlledSize.toLong
@@ -246,10 +298,11 @@ private[h2] class H2Connection[F[_]](
         val bv = chunk.foldLeft(ByteVector.empty) { case (acc, frame) =>
           acc ++ H2Frame.toByteVector(frame)
         }
-        state.update(s =>
-          s.copy(writeWindow = s.writeWindow - fullDataSize.toInt, stallStart = None)
-        ) >>
-          socket.write(Chunk.byteVector(bv)) >>
+        // Reserve credit before writing: the peer can acknowledge these bytes before
+        // socket.write completes. Keep that concurrent WINDOW_UPDATE within the real window.
+        state.update(s => s.copy(writeWindow = s.writeWindow - fullDataSize.toInt)) >>
+          withStallTimeout(socket.write(Chunk.byteVector(bv))) >>
+          state.update(_.copy(stallStart = None)) >>
           chunk.traverse_(frame => logger.debug(s"$addrStr Write - $frame"))
       } else {
         val (nonData, after) = chunk.indexWhere(_.isInstanceOf[H2Frame.Data]) match {
@@ -260,29 +313,21 @@ private[h2] class H2Connection[F[_]](
         val bv = nonData.foldLeft(ByteVector.empty) { case (acc, frame) =>
           acc ++ H2Frame.toByteVector(frame)
         }
-        socket.write(Chunk.byteVector(bv)) >>
+        withStallTimeout(socket.write(Chunk.byteVector(bv))) >>
           nonData.traverse_(frame => logger.debug(s"$addrStr Write - $frame")) >>
-          Temporal[F].monotonic.flatMap { now =>
-            state.update(st => st.copy(stallStart = st.stallStart.orElse(Some(now))))
-          } >>
-          s.writeBlock.get.rethrow >>
-          Temporal[F].monotonic.flatMap { current =>
-            state.get.flatMap { st =>
-              val elapsed = current - st.stallStart.getOrElse(current)
-              if (elapsed >= idleTimeout)
-                logger.debug(s"connection stall timeout exceeded ($elapsed)") >>
-                  goAway(H2Error.ProtocolError)
-              else
-                go(after)
-            }
+          { // avoid stalling if only control frames were written
+            if (after.isEmpty) state.update(s => s.copy(stallStart = None))
+            else withStallTimeout(s.writeBlock.get.rethrow) >> go(after)
           }
       }
     }
+
     val firstGoAway = chunk.collectFirst { case g: H2Frame.GoAway =>
       mapRef.get.flatMap { m =>
         m.values.toList.traverse_(connection => connection.receiveGoAway(g))
       } >> state.update(s => s.copy(closed = true))
     }
+
     firstGoAway.getOrElse(F.unit) >> go(chunk)
   }
 
@@ -303,8 +348,19 @@ private[h2] class H2Connection[F[_]](
   def readLoop: F[Unit] = {
 
     def connectionTerminated: String = s"Connection $addrStr readLoop Terminated"
-    val readFromSocket: F[Option[Chunk[Byte]]] =
-      socket.read(localSettings.initialWindowSize.windowSize)
+    val readFromSocket: F[Option[Chunk[Byte]]] = {
+      val read = socket.read(localSettings.initialWindowSize.windowSize)
+      readIdleTimeout match {
+        case timeout: FiniteDuration =>
+          F.race(read, F.sleep(timeout).untilM_(peerAwaitingResponse.map(!_))).flatMap {
+            case Left(chunk) => F.pure(chunk)
+            case Right(_) =>
+              logger.debug(s"$addrStr readLoop idle timeout exceeded ($timeout)") >>
+                goAway(H2Error.ProtocolError).as(Option.empty[Chunk[Byte]])
+          }
+        case _ => read
+      }
+    }
 
     def readNextFrame(acc: ByteVector): F[Option[(H2Frame, ByteVector)]] =
       if (acc.isEmpty) {
@@ -313,26 +369,25 @@ private[h2] class H2Connection[F[_]](
           case None =>
             logger.debug(s"$connectionTerminated with empty").as(None)
         }
+      } else if (
+        H2Frame.RawFrame.peekDeclaredLength(acc).exists(_ > localSettings.maxFrameSize.frameSize)
+      ) {
+        logger.warn(
+          "Received Frame Size Larger than Allowed Frame Size - Frame Size Error - Issuing GoAway"
+        ) >> goAway(H2Error.FrameSizeError) >> F.pure(None)
       } else
-        H2Frame.RawFrame.payloadLength(acc) match {
-          case Some(length) if length > localSettings.maxFrameSize.frameSize =>
-            logger.warn(
-              s"$connectionTerminated frame payload exceeds SETTINGS_MAX_FRAME_SIZE"
-            ) >> goAway(H2Error.FrameSizeError) >> F.pure(None)
-          case _ =>
-            H2Frame.RawFrame.fromByteVector(acc) match {
-              case Some((raw, leftover)) =>
-                H2Frame.fromRaw(raw) match {
-                  case Right(frame) => F.pure(Some((frame, leftover)))
-                  case Left(e) =>
-                    logger.warn(s"$connectionTerminated invalid Raw to Frame $e") >>
-                      goAway(e) >> F.pure(None)
-                }
-              case None =>
-                readFromSocket.flatMap {
-                  case Some(chunk) => readNextFrame(acc ++ chunk.toByteVector)
-                  case None => logger.debug(s"$connectionTerminated with $acc").as(None)
-                }
+        H2Frame.RawFrame.fromByteVector(acc) match {
+          case Some((raw, leftover)) =>
+            H2Frame.fromRaw(raw) match {
+              case Right(frame) => F.pure(Some((frame, leftover)))
+              case Left(e) =>
+                logger.warn(s"$connectionTerminated invalid Raw to Frame $e") >>
+                  goAway(e) >> F.pure(None)
+            }
+          case None =>
+            readFromSocket.flatMap {
+              case Some(chunk) => readNextFrame(acc ++ chunk.toByteVector)
+              case None => logger.debug(s"$connectionTerminated with $acc").as(None)
             }
         }
 

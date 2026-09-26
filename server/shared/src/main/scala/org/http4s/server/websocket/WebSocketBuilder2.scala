@@ -18,6 +18,7 @@ package org.http4s
 package server.websocket
 
 import cats.Applicative
+import cats.effect.kernel.Temporal
 import cats.effect.kernel.Unique
 import cats.syntax.all._
 import cats.~>
@@ -27,9 +28,13 @@ import org.http4s.websocket.WebSocket
 import org.http4s.websocket.WebSocketCombinedPipe
 import org.http4s.websocket.WebSocketContext
 import org.http4s.websocket.WebSocketFrame
+import org.http4s.websocket.WebSocketFrameDefragmenter.DefaultMaxFragmentCount
 import org.http4s.websocket.WebSocketFrameDefragmenter.defragFragment
 import org.http4s.websocket.WebSocketSeparatePipe
 import org.typelevel.vault.Key
+
+import scala.concurrent.duration.DurationInt
+import scala.concurrent.duration.FiniteDuration
 
 /** Build a response which will accept an HTTP websocket upgrade request and initiate a websocket connection using the
   * supplied exchange to process and respond to websocket messages.
@@ -44,6 +49,9 @@ import org.typelevel.vault.Key
   *                    To prevent WebSocketBuilder2 from handling defrag, you must explicitly call withDefragment(false).
   *                    For more information on defrag processing, see the WebSocketFrameDefragmenter comment.
   *                    default: true
+  * @param heartbeat If `Some`, send a `Ping` frame at the given interval and close the connection
+  *                  when the client does not answer it with a `Pong` in time.
+  *                  default: None
   */
 sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
     headers: Headers,
@@ -53,6 +61,8 @@ sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
     filterPingPongs: Boolean,
     defragFrame: Boolean,
     maxMessageSize: Long,
+    maxFragmentCount: Int,
+    heartbeat: Option[F[Heartbeat[F]]],
     private[http4s] val webSocketKey: Key[WebSocketContext[F]],
 ) {
   import WebSocketBuilder2.impl
@@ -77,6 +87,8 @@ sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
       filterPingPongs = filterPingPongs,
       defragFrame = false,
       maxMessageSize = WebSocketBuilder2.DefaultMaxMessageSize,
+      maxFragmentCount = DefaultMaxFragmentCount,
+      heartbeat = None,
       webSocketKey = webSocketKey,
     )
 
@@ -89,6 +101,8 @@ sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
       defragFrame: Boolean = this.defragFrame,
       webSocketKey: Key[WebSocketContext[F]] = this.webSocketKey,
       maxMessageSize: Long = this.maxMessageSize,
+      maxFragmentCount: Int = this.maxFragmentCount,
+      heartbeat: Option[F[Heartbeat[F]]] = this.heartbeat,
   ): WebSocketBuilder2[F] = WebSocketBuilder2.impl[F](
     headers,
     onNonWebSocketRequest,
@@ -98,6 +112,8 @@ sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
     defragFrame,
     webSocketKey,
     maxMessageSize,
+    maxFragmentCount,
+    heartbeat,
   )
 
   def withHeaders(headers: Headers): WebSocketBuilder2[F] =
@@ -122,6 +138,35 @@ sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
   def withMaxMessageSize(maxMessageSize: Long): WebSocketBuilder2[F] =
     copy(maxMessageSize = maxMessageSize)
 
+  /** Maximum fragments a message can be split across.  Only applies when `withDefragment` is true. */
+  def withMaxFragmentCount(maxFragmentCount: Int): WebSocketBuilder2[F] =
+    copy(maxFragmentCount = maxFragmentCount)
+
+  /** Closes connections to clients that stopped answering.
+    *
+    * Sends a `Ping` frame every `every`.
+    * If the client does not answer with a matching `Pong` (same payload) within `every`, closes the connection with
+    * code 1011.
+    *
+    * If a handler never reads from the connection, it sees no pongs at all, and closes when the first ping goes unanswered.
+    *
+    * @param every The interval between pings. It is also the time the client has to answer one.
+    *              default: 12 seconds
+    * @param frame The ping to send. Only a pong that echoes its payload is a valid answer.
+    *              default: an empty payload
+    * @see [[withoutHeartbeat]]
+    * @see [[https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers#pings_and_pongs_the_heartbeat_of_websockets Pings and Pongs: The Heartbeat of WebSockets]]
+    */
+  def withHeartbeat(
+      every: FiniteDuration = 12.seconds,
+      frame: WebSocketFrame.Ping = WebSocketFrame.Ping(),
+  )(implicit F: Temporal[F]): WebSocketBuilder2[F] =
+    copy(heartbeat = Some(Heartbeat.start(every, frame)))
+
+  /** Do not send pings, the default. */
+  def withoutHeartbeat: WebSocketBuilder2[F] =
+    copy(heartbeat = None)
+
   /** Transform the parameterized effect from F to G. */
   def imapK[G[_]: Applicative](fk: F ~> G)(gk: G ~> F): WebSocketBuilder2[G] =
     impl[G](
@@ -133,15 +178,21 @@ sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
       defragFrame,
       webSocketKey.imap(_.imapK(fk)(gk))(_.imapK(gk)(fk)),
       maxMessageSize,
+      maxFragmentCount,
+      heartbeat.map(fk(_).map(_.imapK(fk)(gk))),
     )
 
-  private def buildResponse(webSocket: WebSocket[F]): F[Response[F]] =
-    onNonWebSocketRequest
-      .map(
-        _.withAttribute(
+  /** Starts the heartbeat, if there is one, and lets it ping on `webSocket`. */
+  private def startHeartbeat(webSocket: WebSocket[F]): F[WebSocket[F]] =
+    heartbeat.fold(webSocket.pure[F])(_.map(_(webSocket)))
+
+  private def buildResponse(webSocket: F[WebSocket[F]]): F[Response[F]] =
+    (webSocket, onNonWebSocketRequest)
+      .mapN((ws, response) =>
+        response.withAttribute(
           webSocketKey,
           WebSocketContext(
-            webSocket,
+            ws,
             headers,
             onHandshakeFailure,
           ),
@@ -175,10 +226,14 @@ sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
         case (true, false) => sendReceive.compose(filterPingPongFrames)
         case (false, false) => sendReceive
         case (true, true) =>
-          sendReceive.compose(defragFragment(maxMessageSize).compose(filterPingPongFrames))
-        case (false, true) => sendReceive.compose(defragFragment(maxMessageSize))
+          sendReceive.compose(
+            defragFragment(maxMessageSize, DefaultMaxFragmentCount).compose(filterPingPongFrames)
+          )
+        case (false, true) =>
+          sendReceive.compose(defragFragment(maxMessageSize, DefaultMaxFragmentCount))
       }
-    buildResponse(WebSocketCombinedPipe(finalSendReceive, onClose))
+
+    buildResponse(startHeartbeat(WebSocketCombinedPipe(finalSendReceive, onClose)))
   }
 
   /** @param send     The send side of the Exchange represents the outgoing stream of messages that should be sent to the client
@@ -212,11 +267,14 @@ sealed abstract class WebSocketBuilder2[F[_]: Applicative] private (
         case (true, false) => receive.compose(filterPingPongFrames)
         case (false, false) => receive
         case (true, true) =>
-          receive.compose(defragFragment(maxMessageSize).compose(filterPingPongFrames))
-        case (false, true) => receive.compose(defragFragment(maxMessageSize))
+          receive.compose(
+            defragFragment(maxMessageSize, maxFragmentCount).compose(filterPingPongFrames)
+          )
+        case (false, true) =>
+          receive.compose(defragFragment(maxMessageSize, maxFragmentCount))
       }
 
-    buildResponse(WebSocketSeparatePipe(send, finalReceive, onClose))
+    buildResponse(startHeartbeat(WebSocketSeparatePipe(send, finalReceive, onClose)))
   }
 
   private val isPingPong: WebSocketFrame => Boolean = {
@@ -259,6 +317,8 @@ object WebSocketBuilder2 {
       defragFrame = true,
       webSocketKey = webSocketKey,
       maxMessageSize = WebSocketBuilder2.DefaultMaxMessageSize,
+      maxFragmentCount = DefaultMaxFragmentCount,
+      heartbeat = None,
     )
 
   private def impl[F[_]: Applicative](
@@ -270,6 +330,8 @@ object WebSocketBuilder2 {
       defragFrame: Boolean,
       webSocketKey: Key[WebSocketContext[F]],
       maxMessageSize: Long,
+      maxFragmentCount: Int,
+      heartbeat: Option[F[Heartbeat[F]]],
   ): WebSocketBuilder2[F] =
     new WebSocketBuilder2[F](
       headers = headers,
@@ -280,5 +342,7 @@ object WebSocketBuilder2 {
       defragFrame = defragFrame,
       webSocketKey = webSocketKey,
       maxMessageSize = maxMessageSize,
+      maxFragmentCount = maxFragmentCount,
+      heartbeat = heartbeat,
     ) {}
 }
