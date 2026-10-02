@@ -19,6 +19,7 @@ package org.http4s.ember.core.h2
 import cats.data._
 import cats.effect._
 import cats.effect.std._
+import cats.effect.syntax.all._
 import cats.syntax.all._
 import org.http4s.ember.core.EmberException
 import scodec.bits._
@@ -28,6 +29,11 @@ import java.nio.charset.StandardCharsets
 
 private[h2] trait Hpack[F[_]] {
   def encodeHeaders(headers: NonEmptyList[(String, String, Boolean)]): F[ByteVector]
+
+  /** Keeps encoder updates in the same order as the corresponding outgoing header blocks. */
+  def encodeHeadersWith[A](headers: NonEmptyList[(String, String, Boolean)])(
+      send: ByteVector => F[A]
+  ): F[A]
   def decodeHeaders(bv: ByteVector): F[NonEmptyList[(String, String)]]
 
   /** Advances HPACK decoder state without materializing a field list. */
@@ -35,22 +41,51 @@ private[h2] trait Hpack[F[_]] {
 }
 
 private[h2] object Hpack extends HpackPlatform {
-  def create[F[_]: Async](maxHeaderListSize: Int): F[Hpack[F]] = for {
+  def create[F[_]: Async](maxHeaderListSize: Int): F[Hpack[F]] =
+    create(maxHeaderListSize, Async[F].unit)
+
+  def create[F[_]: Async](maxHeaderListSize: Int, onEncodeFailure: F[Unit]): F[Hpack[F]] = for {
     eLock <- Mutex[F]
+    eFailed <- Ref.of[F, Boolean](false)
     dLock <- Mutex[F]
     e <- Sync[F].delay(new Encoder(4096))
     d <- Sync[F].delay(new Decoder(maxHeaderListSize, 4096))
-  } yield new Impl(eLock, e, dLock, d, maxHeaderListSize.toLong)
+  } yield new Impl(eLock, eFailed, onEncodeFailure, e, dLock, d, maxHeaderListSize.toLong)
 
   private class Impl[F[_]: Async](
       encodeLock: Mutex[F],
+      encodeFailed: Ref[F, Boolean],
+      onEncodeFailure: F[Unit],
       tEncoder: Encoder,
       decodeLock: Mutex[F],
       tDecoder: Decoder,
       maxHeaderListSize: Long,
   ) extends Hpack[F] {
     def encodeHeaders(headers: NonEmptyList[(String, String, Boolean)]): F[ByteVector] =
-      encodeLock.lock.surround(Hpack.encodeHeaders[F](tEncoder, headers.toList))
+      encodeHeadersWith(headers)(Async[F].pure(_))
+
+    def encodeHeadersWith[A](headers: NonEmptyList[(String, String, Boolean)])(
+        send: ByteVector => F[A]
+    ): F[A] =
+      encodeLock.lock.surround {
+        Async[F].uncancelable { poll =>
+          encodeFailed.get.flatMap {
+            case true =>
+              new IllegalStateException("HPACK encoder is no longer usable").raiseError[F, A]
+            case false =>
+              // Queue offers must remain cancelable when a stalled writer has filled the queue.
+              // Once encoding has advanced the dynamic table, losing its block invalidates the
+              // connection. Poison the encoder before releasing the lock to any waiting sender.
+              Hpack
+                .encodeHeaders[F](tEncoder, headers.toList)
+                .flatMap(bytes => poll(send(bytes)))
+                .guaranteeCase {
+                  case Outcome.Succeeded(_) => Async[F].unit
+                  case _ => encodeFailed.set(true) >> onEncodeFailure
+                }
+          }
+        }
+      }
     def decodeHeaders(bv: ByteVector): F[NonEmptyList[(String, String)]] =
       decodeLock.lock.surround(Hpack.decodeHeaders[F](tDecoder, bv, maxHeaderListSize))
     def decodeHeadersAndDiscard(bv: ByteVector): F[Unit] =

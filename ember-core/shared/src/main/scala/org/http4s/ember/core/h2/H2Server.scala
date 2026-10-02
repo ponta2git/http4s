@@ -38,6 +38,38 @@ import H2Frame.Settings.ConnectionSettings.{default => defaultSettings}
 
 private[ember] object H2Server {
 
+  private[h2] def discardResponseBody[F[_]: Concurrent](body: EntityBody[F]): F[Unit] = {
+    val F = Concurrent[F]
+    // Keep cancellation masked while fs2 registers the body's resource scopes. Polling
+    // ordinary effects cancels before they run, while nested acquisition and release
+    // masks retain their usual semantics. A chunk checkpoint also stops pure bodies.
+    val discard = F.uncancelable { poll =>
+      body.chunks
+        .evalMap(_ => F.unit)
+        .translate(new (F ~> F) {
+          def apply[A](fa: F[A]): F[A] = F.canceled >> poll(fa)
+        })
+        .compile
+        .drain
+    }
+    // A fresh fiber makes the poll cancelable even when called from a Resource finalizer.
+    discard.start.flatMap(_.join).flatMap {
+      case Outcome.Succeeded(result) => result
+      case Outcome.Errored(error) => F.raiseError(error)
+      case Outcome.Canceled() => F.unit
+    }
+  }
+
+  private[h2] def responseResource[F[_]: Concurrent](
+      response: F[Response[F]]
+  ): Resource[F, (Response[F], F[Unit])] =
+    for {
+      bodyStarted <- Resource.eval(Ref.of[F, Boolean](false))
+      resp <- Resource.makeFull[F, Response[F]](poll => poll(response))(resp =>
+        bodyStarted.get.ifM(Applicative[F].unit, discardResponseBody(resp.body))
+      )
+    } yield (resp, bodyStarted.set(true))
+
   /*
   2 Mechanism into H2
 
@@ -111,7 +143,8 @@ private[ember] object H2Server {
       )
       queue <- cats.effect.std.Queue.bounded[F, Chunk[H2Frame]](128)
       hpack <- Hpack.create[F](
-        localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize)
+        localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize),
+        H2Connection.abort(stateRef, ref),
       )
       settingsAck <- Deferred[F, Either[Throwable, H2Frame.Settings.ConnectionSettings]]
       streamCreationLock <- Semaphore[F](1)
@@ -166,27 +199,21 @@ private[ember] object H2Server {
             }
           )
 
-        def sendData(resp: Response[F], stream: H2Stream[F]): F[Unit] =
-          resp.body.chunks
-            .foreach(c => stream.sendData(c.toByteVector, endStream = false))
-            .compile
-            .drain >> // PP Resp Body
-            stream.sendData(ByteVector.empty, endStream = true)
-
-        def respond(req: Request[Pure], stream: H2Stream[F]): F[(EntityBody[F], H2Stream[F])] =
-          for {
-            resp <- httpApp(req.covary[F])
-            // _ <- Console.make[F].println("Push Promise Response Completed")
-            pseudoHeaders = PseudoHeaders.responseToHeaders(resp)
-            _ <- stream.sendHeaders(pseudoHeaders, endStream = false) // PP Response
-          } yield (resp.body, stream)
+        def respond(req: Request[Pure], stream: H2Stream[F]): F[Unit] =
+          responseResource(httpApp(req.covary[F])).use { case (pushedResponse, beforeBody) =>
+            stream.sendHeaders(
+              PseudoHeaders.responseToHeaders(pushedResponse),
+              endStream = false,
+            ) >>
+              stream.sendMessageBody(pushedResponse, beforeBody) >>
+              stream.sendTrailerHeaders(pushedResponse)
+          }
 
         resp.attributes.lookup(H2Keys.PushPromises).traverse_ { (l: List[Request[Pure]]) =>
           h2.state.get.flatMap {
             case s if s.remoteSettings.enablePush.isEnabled =>
               l.traverse(sender)
-                .flatMap(_.parTraverse { case (req, stream) => respond(req, stream) })
-                .flatMap(_.parTraverse_ { case (_, stream) => sendData(resp, stream) })
+                .flatMap(_.parTraverse_ { case (req, stream) => respond(req, stream) })
             case _ => Applicative[F].unit
           }
         }
@@ -200,11 +227,12 @@ private[ember] object H2Server {
           case true =>
             for {
               req <- stream.getRequest.map(_.covary[F].withBodyStream(stream.readBody))
-              resp <- httpApp(req)
-              _ <- stream.sendHeaders(PseudoHeaders.responseToHeaders(resp), endStream = false)
-              _ <- fulfillPushPromises(resp)
-              _ <- stream.sendMessageBody(resp) // Initial Resp Body
-              _ <- stream.sendTrailerHeaders(resp)
+              _ <- responseResource(httpApp(req)).use { case (resp, beforeBody) =>
+                stream.sendHeaders(PseudoHeaders.responseToHeaders(resp), endStream = false) >>
+                  fulfillPushPromises(resp) >>
+                  stream.sendMessageBody(resp, beforeBody) >>
+                  stream.sendTrailerHeaders(resp)
+              }
               _ <- stream.state.get.flatMap { streamState =>
                 // The response no longer owns a request body consumer. RFC 9113, section 8.1
                 // permits NO_ERROR after the complete response when the request is unfinished.

@@ -717,6 +717,20 @@ private[h2] class H2Connection[F[_]](
 }
 
 private[h2] object H2Connection {
+  // An unsent encoded header block leaves the encoder ahead of its peer. Stop using the
+  // connection and unblock its readers without depending on a possibly full outgoing queue.
+  def abort[F[_]: Concurrent](
+      state: Ref[F, State[F]],
+      streams: Ref[F, Map[Int, H2Stream[F]]],
+  ): F[Unit] =
+    state.modify(s => (s.copy(closed = true), s)).flatMap { previous =>
+      previous.writeBlock.complete(Left(KillWithoutMessage())).void >>
+        streams.get.flatMap { open =>
+          val goAway = H2Error.CompressionError.toGoAway(previous.remoteHighestStream)
+          open.values.toList.traverse_(_.receiveGoAway(goAway))
+        }
+    }
+
   final case class State[F[_]](
       remoteSettings: H2Frame.Settings.ConnectionSettings,
       writeWindow: Int,

@@ -67,10 +67,13 @@ private[h2] class H2Stream[F[_]: Temporal](
           s.state match {
             case StreamState.Idle =>
               for {
-                h <- hpack.encodeHeaders(headers)
-                frame = H2Frame.PushPromise(originating, endHeaders = true, id, h, None)
-                _ <- state.update(s => s.copy(state = StreamState.ReservedLocal))
-                _ <- enqueue.offer(Chunk.singleton(frame))
+                _ <- hpack.encodeHeadersWith(headers) { h =>
+                  val frame = H2Frame.PushPromise(originating, endHeaders = true, id, h, None)
+                  Temporal[F].uncancelable { poll =>
+                    state.update(s => s.copy(state = StreamState.ReservedLocal)) >>
+                      poll(enqueue.offer(Chunk.singleton(frame)))
+                  }
+                }
               } yield ()
             case _ =>
               new IllegalStateException(
@@ -87,7 +90,10 @@ private[h2] class H2Stream[F[_]: Temporal](
     *
     * @param mess the [[Message]] to send
     */
-  def sendMessageBody(mess: Message[F]): F[Unit] = {
+  def sendMessageBody(mess: Message[F]): F[Unit] =
+    sendMessageBody(mess, Applicative[F].unit)
+
+  def sendMessageBody(mess: Message[F], beforeBody: F[Unit]): F[Unit] = {
     val noTrailers = !mess.attributes.contains(Message.Keys.TrailerHeaders[F])
     val maxFrameSize = remoteSettings.map(_.maxFrameSize.frameSize)
     maxFrameSize.flatMap { maxFrameSize =>
@@ -95,6 +101,15 @@ private[h2] class H2Stream[F[_]: Temporal](
         mess.body
           .chunkLimit(maxFrameSize)
           .foreach(c => sendData(c.toByteVector, endStream = false))
+          .translate(new (F ~> F) {
+            def apply[A](fa: F[A]): F[A] =
+              Temporal[F].uncancelable { poll =>
+                // Register ownership inside the first actual body effect. fs2's resource
+                // acquisition mask protects leading finalizers; ordinary body and write
+                // effects remain cancelable, including those fs2 evaluates in another fiber.
+                beforeBody >> poll(fa)
+              }
+          })
           .compile
           .drain >> sendData(ByteVector.empty, endStream = true).whenA(noTrailers)
       sendBody.onError { case _ =>
@@ -121,28 +136,30 @@ private[h2] class H2Stream[F[_]: Temporal](
       s.state match {
         case StreamState.Idle | StreamState.HalfClosedRemote | StreamState.Open |
             StreamState.ReservedLocal =>
-          hpack.encodeHeaders(headers).flatMap { bv =>
+          hpack.encodeHeadersWith(headers) { bv =>
             val f = H2Frame.Headers(id, None, endStream, endHeaders = true, bv, None)
-            enqueue.offer(Chunk.singleton(f))
-          } <*
-            state
-              .modify { b =>
-                val newState: StreamState = (b.state, endStream) match {
-                  case (StreamState.Idle, false) => StreamState.Open
-                  case (StreamState.Idle, true) => StreamState.HalfClosedLocal
-                  case (StreamState.HalfClosedRemote, false) => StreamState.HalfClosedRemote
-                  case (StreamState.HalfClosedRemote, true) => StreamState.Closed
-                  case (StreamState.Open, false) => StreamState.Open
-                  case (StreamState.Open, true) => StreamState.HalfClosedLocal
-                  case (StreamState.ReservedLocal, true) => StreamState.Closed
-                  case (StreamState.ReservedLocal, false) => StreamState.HalfClosedRemote
-                  case (st, _) => st // Hopefully Impossible
-                }
-                (b.copy(state = newState), newState)
-              }
-              .flatMap { state =>
-                if (state == StreamState.Closed) onClosed else Applicative[F].unit
-              }
+            Temporal[F].uncancelable { poll =>
+              poll(enqueue.offer(Chunk.singleton(f))) >>
+                state
+                  .modify { b =>
+                    val newState: StreamState = (b.state, endStream) match {
+                      case (StreamState.Idle, false) => StreamState.Open
+                      case (StreamState.Idle, true) => StreamState.HalfClosedLocal
+                      case (StreamState.HalfClosedRemote, false) => StreamState.HalfClosedRemote
+                      case (StreamState.HalfClosedRemote, true) => StreamState.Closed
+                      case (StreamState.Open, false) => StreamState.Open
+                      case (StreamState.Open, true) => StreamState.HalfClosedLocal
+                      case (StreamState.ReservedLocal, true) => StreamState.Closed
+                      case (StreamState.ReservedLocal, false) => StreamState.HalfClosedRemote
+                      case (st, _) => st // Hopefully Impossible
+                    }
+                    (b.copy(state = newState), newState)
+                  }
+                  .flatMap { state =>
+                    if (state == StreamState.Closed) onClosed else Applicative[F].unit
+                  }
+            }
+          }
         case _ => new IllegalStateException("Stream Was Closed").raiseError
       }
     }

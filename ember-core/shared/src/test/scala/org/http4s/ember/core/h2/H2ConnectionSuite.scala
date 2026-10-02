@@ -80,6 +80,7 @@ class H2ConnectionSuite extends Http4sSuite {
       connectionType: H2Connection.ConnectionType = H2Connection.ConnectionType.Server,
       socketOverride: Option[Socket[IO]] = None,
       idleTimeout: Duration = Duration.Inf,
+      outgoingOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
   ): IO[H2Connection[IO]] =
     for {
       socket <- socketOverride.fold(readOnlySocket(input))(_.pure[IO])
@@ -89,11 +90,12 @@ class H2ConnectionSuite extends Http4sSuite {
         H2Frame.Settings.ConnectionSettings.default.initialWindowSize,
         H2Frame.Settings.ConnectionSettings.default.initialWindowSize,
       )
-      outgoing <- Queue.unbounded[IO, Chunk[H2Frame]]
+      outgoing <- outgoingOverride.fold(Queue.unbounded[IO, Chunk[H2Frame]])(IO.pure)
       created <- Queue.unbounded[IO, Int]
       closed <- Queue.unbounded[IO, Int]
       hpack <- Hpack.create[IO](
-        localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize)
+        localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize),
+        H2Connection.abort(stateRef, mapRef),
       )
       lock <- Semaphore[IO](1)
       ack <- Deferred[IO, Either[Throwable, H2Frame.Settings.ConnectionSettings]]
@@ -907,4 +909,48 @@ class H2ConnectionSuite extends Http4sSuite {
       Some(H2Error.EnhanceYourCalm.value),
     )
   }
+
+  test("canceling an encoded header blocked on a full queue aborts connection waiters") {
+    TestControl.executeEmbed {
+      val headers = NonEmptyList.one(("x-dynamic", "value", false))
+      val queued = Chunk.singleton[H2Frame](
+        H2Frame.Ping(0, ack = false, ByteVector.fill(8)(0))
+      )
+      for {
+        outgoing <- Queue.bounded[IO, Chunk[H2Frame]](1)
+        _ <- outgoing.offer(queued)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          H2Connection.ConnectionType.Client,
+          outgoingOverride = Some(outgoing),
+        )
+        stream <- h2.initiateLocalStream
+        streamState <- stream.state.get
+        _ <- streamState.readBuffer.send(Right(ByteVector.empty)).replicateA_(128)
+        _ <- stream
+          .sendHeaders(headers, endStream = false)
+          .background
+          .use(_ => IO.sleep(1.second))
+          .timeout(2.seconds)
+        closed <- h2.state.get.map(_.closed)
+        response <- stream.getResponse.attempt.timeout(1.second)
+        body <- stream.readBody.compile.drain.attempt.timeout(1.second)
+        write <- streamState.writeBlock.get.timeout(1.second)
+        connectionWrite <- h2.state.get.flatMap(_.writeBlock.get).timeout(1.second)
+        next <- h2.initiateLocalStream
+        subsequent <- next.sendHeaders(headers, endStream = false).attempt.timeout(1.second)
+        frames <- drainOutgoing(h2)
+      } yield {
+        assert(closed)
+        assert(response.isLeft, clue(response))
+        assert(body.isLeft, clue(body))
+        assert(write.isLeft, clue(write))
+        assert(connectionWrite.isLeft, clue(connectionWrite))
+        assert(subsequent.isLeft, clue(subsequent))
+        assertEquals(frames, queued.toVector)
+      }
+    }
+  }
+
 }

@@ -192,7 +192,8 @@ private[ember] class H2Client[F[_]](
         )
         queue <- cats.effect.std.Queue.bounded[F, Chunk[H2Frame]](128)
         hpack <- Hpack.create[F](
-          localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize)
+          localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize),
+          H2Connection.abort(stateRef, ref),
         )
         settingsAck <- Deferred[F, Either[Throwable, H2Frame.Settings.ConnectionSettings]]
         streamCreationLock <- cats.effect.std.Semaphore[F](1)

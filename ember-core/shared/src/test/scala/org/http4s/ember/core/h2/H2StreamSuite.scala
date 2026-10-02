@@ -46,6 +46,8 @@ class H2StreamSuite extends Http4sSuite {
       connectionType: H2Connection.ConnectionType = H2Connection.ConnectionType.Server,
       onClosed: IO[Unit] = IO.unit,
       hpackOverride: Option[Hpack[IO]] = None,
+      id: Int = 1,
+      outgoingOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
   ): IO[(H2Stream[IO], Queue[IO, Chunk[H2Frame]])] =
     for {
       writeBlock <- Deferred[IO, Either[Throwable, Unit]]
@@ -70,9 +72,9 @@ class H2StreamSuite extends Http4sSuite {
       )
       hpack <- hpackOverride.fold(Hpack.create[IO](1024))(IO.pure)
       logger <- log4cats.noop.NoOpFactory[IO].fromClass(classOf[H2StreamSuite])
-      outgoing <- Queue.unbounded[IO, Chunk[H2Frame]]
+      outgoing <- outgoingOverride.fold(Queue.unbounded[IO, Chunk[H2Frame]])(IO.pure)
       stream = new H2Stream[IO](
-        1,
+        id,
         60.seconds,
         defaultSettings,
         connectionType,
@@ -611,6 +613,9 @@ class H2StreamSuite extends Http4sSuite {
           gated = new Hpack[IO] {
             def encodeHeaders(headers: NonEmptyList[(String, String, Boolean)]): IO[ByteVector] =
               delegate.encodeHeaders(headers)
+            def encodeHeadersWith[A](headers: NonEmptyList[(String, String, Boolean)])(
+                send: ByteVector => IO[A]
+            ): IO[A] = delegate.encodeHeadersWith(headers)(send)
             def decodeHeaders(bytes: ByteVector): IO[NonEmptyList[(String, String)]] =
               entered.complete(()).void >> resume.get >> delegate.decodeHeaders(bytes)
             def decodeHeadersAndDiscard(bytes: ByteVector): IO[Unit] =
@@ -735,4 +740,156 @@ class H2StreamSuite extends Http4sSuite {
       case Some(chunk) => drainFrames(queue).map(chunk.toVector ++ _)
       case None => IO.pure(Vector.empty)
     }
+
+  List(
+    ("headers", "headers"),
+    ("headers", "trailers"),
+    ("trailers", "headers"),
+    ("headers", "push promise"),
+    ("push promise", "headers"),
+  ).foreach { case (firstBlock, secondBlock) =>
+    test(s"concurrent $firstBlock then $secondBlock follows the connection's HPACK encoding order") {
+      TestControl.executeEmbed {
+        val headers = NonEmptyList.one(("x-dynamic", "value", false))
+        def send(stream: H2Stream[IO], block: String): IO[Unit] = block match {
+          case "push promise" =>
+            stream.state.update(_.copy(state = H2Stream.StreamState.Idle)) >>
+              stream.sendPushPromise(1, headers)
+          case "trailers" =>
+            stream.sendTrailerHeaders(
+              Response[IO]().withTrailerHeaders(IO.pure(Headers("x-dynamic" -> "value")))
+            )
+          case _ => stream.sendHeaders(headers, endStream = false)
+        }
+        for {
+          delegate <- Hpack.create[IO](1024)
+          decoder <- Hpack.create[IO](1024)
+          outgoing <- Queue.unbounded[IO, Chunk[H2Frame]]
+          entered <- Deferred[IO, Unit]
+          resume <- Deferred[IO, Unit]
+          calls <- Ref[IO].of(0)
+          gated = new Hpack[IO] {
+            def encodeHeaders(headers: NonEmptyList[(String, String, Boolean)]): IO[ByteVector] =
+              delegate.encodeHeaders(headers)
+            def encodeHeadersWith[A](headers: NonEmptyList[(String, String, Boolean)])(
+                send: ByteVector => IO[A]
+            ): IO[A] =
+              delegate.encodeHeadersWith(headers) { bytes =>
+                calls.getAndUpdate(_ + 1).flatMap {
+                  case 0 => entered.complete(()).void >> resume.get >> send(bytes)
+                  case _ => send(bytes)
+                }
+              }
+            def decodeHeaders(bytes: ByteVector): IO[NonEmptyList[(String, String)]] =
+              delegate.decodeHeaders(bytes)
+            def decodeHeadersAndDiscard(bytes: ByteVector): IO[Unit] =
+              delegate.decodeHeadersAndDiscard(bytes)
+          }
+          firstPair <- streamAndQueue(
+            defaultSettings,
+            hpackOverride = Some(gated),
+            id = if (firstBlock == "push promise") 2 else 1,
+            outgoingOverride = Some(outgoing),
+          )
+          secondPair <- streamAndQueue(
+            defaultSettings,
+            hpackOverride = Some(gated),
+            id = if (secondBlock == "push promise") 4 else 3,
+            outgoingOverride = Some(outgoing),
+          )
+          (first, _) = firstPair
+          (second, _) = secondPair
+          _ <- send(first, firstBlock).background
+            .use { firstDone =>
+              entered.get >> send(second, secondBlock).background.use { secondDone =>
+                IO.sleep(1.second) >> assertIO(outgoing.size, 0) >>
+                  resume.complete(()) >> firstDone.flatMap(_.embedNever) >>
+                  secondDone.flatMap(_.embedNever)
+              }
+            }
+          chunks <- outgoing.take.replicateA(2)
+          frames = chunks.flatMap(_.toList)
+          blocks = frames.collect {
+            case frame: H2Frame.Headers => frame.headerBlock
+            case frame: H2Frame.PushPromise => frame.headerBlock
+          }
+          decoded <- blocks.traverse(decoder.decodeHeaders)
+        } yield {
+          assertEquals(
+            frames.headOption.collect {
+              case frame: H2Frame.Headers => frame.identifier
+              case frame: H2Frame.PushPromise => frame.identifier
+            },
+            Some(1),
+          )
+          assertEquals(blocks.size, 2)
+          assertEquals(decoded, List.fill(2)(headers.map(h => (h._1, h._2))))
+        }
+      }
+    }
+  }
+
+  private def responseBodyOwnership(cancelAtHandoff: Boolean): IO[Unit] =
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, _) = sq
+      effects <- Ref[IO].of(0)
+      releases <- Ref[IO].of(List.empty[Int])
+      firstScope = Stream
+        .eval(effects.update(_ + 1))
+        .as(1.toByte)
+        .onFinalize(releases.update(1 :: _))
+      body = if (cancelAtHandoff) firstScope else firstScope.onFinalize(releases.update(2 :: _))
+      response = Response[IO](Status.Ok).withBodyStream(body)
+      result <- H2Server
+        .responseResource(IO.pure(response))
+        .use { case (resp, beforeBody) =>
+          stream.sendMessageBody(resp, beforeBody >> IO.canceled.whenA(cancelAtHandoff))
+        }
+        .start
+        .flatMap(_.join)
+      evaluated <- effects.get
+      finalized <- releases.get
+      _ = assertEquals(evaluated, if (cancelAtHandoff) 0 else 1)
+      _ = assertEquals(finalized, if (cancelAtHandoff) List(1) else List(2, 1))
+      _ <- result match {
+        case cats.effect.Outcome.Canceled() => IO(assert(cancelAtHandoff))
+        case cats.effect.Outcome.Succeeded(done) => done >> IO(assert(!cancelAtHandoff))
+        case cats.effect.Outcome.Errored(error) => IO.raiseError(error)
+      }
+    } yield ()
+
+  test("cancellation at response body ownership handoff finalizes the leading scope exactly once") {
+    responseBodyOwnership(cancelAtHandoff = true)
+  }
+
+  test("response body completion releases ownership without repeating finalizers") {
+    responseBodyOwnership(cancelAtHandoff = false)
+  }
+
+  test("a mapped response body waiting for data remains cancelable after ownership handoff") {
+    for {
+      sq <- streamAndQueue(defaultSettings)
+      (stream, _) = sq
+      waiting <- Deferred[IO, Unit]
+      releases <- Ref[IO].of(List.empty[Int])
+      body = Stream
+        .eval(waiting.complete(()).void >> IO.never[Byte])
+        .map(identity)
+        .onFinalize(releases.update(1 :: _))
+        .onFinalize(releases.update(2 :: _))
+      response = Response[IO](Status.Ok).withBodyStream(body)
+      fiber <- H2Server
+        .responseResource(IO.pure(response))
+        .use { case (resp, beforeBody) => stream.sendMessageBody(resp, beforeBody) }
+        .start
+      _ <- waiting.get
+      // Joining separately keeps this regression bounded if cancellation cannot finish.
+      _ <- fiber.cancel.start
+      result <- fiber.join.timeout(2.seconds)
+      finalized <- releases.get
+      _ = assertEquals(finalized, List(2, 1))
+      _ = assert(result.isCanceled)
+    } yield ()
+  }
 }
