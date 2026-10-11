@@ -34,6 +34,7 @@ import org.http4s.Response
 import org.http4s.Status
 import org.http4s.syntax.literals._
 import org.typelevel.log4cats.noop.NoOpFactory
+import org.typelevel.log4cats.testing.TestingLogger
 import scodec.bits.ByteVector
 
 import scala.concurrent.duration._
@@ -256,7 +257,7 @@ class H2ServerRequestBodySuite extends Http4sSuite {
             (":path", "/next", false),
           )
         )
-        logger <- NoOpFactory[IO].fromClass(classOf[H2ServerRequestBodySuite])
+        logger <- TestingLogger.ref[IO]()
         app = Kleisli { (_: org.http4s.Request[IO]) =>
           admission.acquire >> requests.updateAndGet(_ + 1).flatMap { requestNumber =>
             val body = Stream
@@ -266,7 +267,8 @@ class H2ServerRequestBodySuite extends Http4sSuite {
               .onFinalize(admission.release)
             val response = Response[IO](Status.Ok).withBodyStream(body)
             if (requestNumber == 1)
-              responseReady.complete(()).void >> releaseResponse.get.as(response)
+              (responseReady.complete(()).void >> releaseResponse.get.as(response))
+                .onCancel(H2Server.discardResponseBody(response.body))
             else IO.pure(response)
           }
         }
@@ -300,10 +302,89 @@ class H2ServerRequestBodySuite extends Http4sSuite {
               releases <- finalized.get
               evaluated <- bodyEffects.get
               available <- admission.available
+              logs <- logger.logged
+              _ = assertEquals(logs.collect { case e: TestingLogger.ERROR => e }, Vector.empty)
               _ = assertEquals(calls, 2)
               _ = assertEquals(releases, 2)
               _ = assertEquals(evaluated, 1)
               _ = assertEquals(available, 1L)
+            } yield ()
+          }
+      } yield ()
+    }
+  }
+
+  test("RST_STREAM cancels a suspended handler and releases its processing permit") {
+    TestControl.executeEmbed {
+      for {
+        input <- Queue.unbounded[IO, ByteVector]
+        output <- Queue.unbounded[IO, H2Frame]
+        observed <- Ref[IO].of(Vector.empty[H2Frame])
+        entered <- Deferred[IO, Unit]
+        stopped <- Deferred[IO, Unit]
+        admission <- Semaphore[IO](1)
+        hpack <- Hpack.create[IO](65535)
+        headers <- hpack.encodeHeaders(
+          NonEmptyList.of(
+            (":method", "GET", false),
+            (":scheme", "http", false),
+            (":authority", "localhost", false),
+            (":path", "/held", false),
+          )
+        )
+        next <- hpack.encodeHeaders(
+          NonEmptyList.of(
+            (":method", "GET", false),
+            (":scheme", "http", false),
+            (":authority", "localhost", false),
+            (":path", "/next", false),
+          )
+        )
+        logger <- TestingLogger.ref[IO]()
+        app = Kleisli { (request: org.http4s.Request[IO]) =>
+          admission.permit.use { _ =>
+            if (request.uri.path.renderString == "/held")
+              (entered.complete(()).void >> IO.never[Response[IO]])
+                .guarantee(stopped.complete(()).void)
+            else IO.pure(Response[IO](Status.NoContent))
+          }
+        }
+        _ <- H2Server
+          .fromSocket(
+            socket(input, output, observed),
+            app,
+            1.minute,
+            1.minute,
+            settings.copy(maxConcurrentStreams = H2Frame.Settings.SettingsMaxConcurrentStreams(1)),
+            logger,
+          )
+          .use(_ => IO.never[Unit])
+          .background
+          .use { _ =>
+            for {
+              _ <- input.offer(
+                frameBytes(
+                  List(
+                    H2Frame.Settings.ConnectionSettings.toSettings(settings),
+                    H2Frame.Headers(1, None, true, true, headers, None),
+                  )
+                )
+              )
+              _ <- entered.get
+              _ <- input.offer(frameBytes(List(H2Error.Cancel.toRst(1), ping)))
+              _ <- awaitPing(output).timeout(2.seconds)
+              _ <- stopped.get.timeout(2.seconds)
+              _ <- input.offer(frameBytes(List(H2Frame.Headers(3, None, true, true, next, None))))
+              _ <- awaitResponseEnd(output, 3)
+              available <- admission.available
+              frames <- observed.get
+              logs <- logger.logged
+              _ = assertEquals(available, 1L)
+              _ = assert(
+                !frames.exists { case f: H2Frame.RstStream => f.identifier == 3; case _ => false },
+                clue(frames),
+              )
+              _ = assertEquals(logs.collect { case e: TestingLogger.ERROR => e }, Vector.empty)
             } yield ()
           }
       } yield ()
@@ -433,6 +514,83 @@ class H2ServerRequestBodySuite extends Http4sSuite {
               _ = assertEquals(pushedBody, ByteVector(2.toByte))
               _ = assertEquals(initialBody, ByteVector(1.toByte))
               _ = assertEquals(releases.sorted, List("initial", "push"))
+            } yield ()
+          }
+      } yield ()
+    }
+  }
+
+  test("resetting a parent cancels its unfinished push and releases push capacity") {
+    TestControl.executeEmbed {
+      for {
+        input <- Queue.unbounded[IO, ByteVector]
+        output <- Queue.unbounded[IO, H2Frame]
+        observed <- Ref[IO].of(Vector.empty[H2Frame])
+        entered <- Deferred[IO, Unit]
+        stopped <- Deferred[IO, Unit]
+        pushes <- Ref[IO].of(0)
+        hpack <- Hpack.create[IO](65535)
+        headers <- hpack.encodeHeaders(
+          NonEmptyList.of(
+            (":method", "GET", false),
+            (":scheme", "http", false),
+            (":authority", "localhost", false),
+            (":path", "/", false),
+          )
+        )
+        logger <- TestingLogger.ref[IO]()
+        app = Kleisli { (request: org.http4s.Request[IO]) =>
+          if (request.uri.path.renderString == "/push")
+            pushes.updateAndGet(_ + 1).flatMap {
+              case 1 =>
+                (entered.complete(()).void >> IO.never[Response[IO]])
+                  .guarantee(stopped.complete(()).void)
+              case _ => IO.pure(Response[IO](Status.NoContent))
+            }
+          else
+            IO.pure(
+              Response[IO](Status.Ok).withAttribute(
+                H2Keys.PushPromises,
+                List(org.http4s.Request[fs2.Pure](uri = uri"http://localhost/push")),
+              )
+            )
+        }
+        _ <- H2Server
+          .fromSocket(socket(input, output, observed), app, 1.minute, 1.minute, settings, logger)
+          .use(_ => IO.never[Unit])
+          .background
+          .use { _ =>
+            for {
+              _ <- input.offer(
+                frameBytes(
+                  List(
+                    H2Frame.Settings.ConnectionSettings.toSettings(
+                      settings.copy(
+                        maxConcurrentStreams = H2Frame.Settings.SettingsMaxConcurrentStreams(1)
+                      )
+                    ),
+                    H2Frame.Headers(1, None, true, true, headers, None),
+                  )
+                )
+              )
+              _ <- entered.get
+              _ <- input.offer(frameBytes(List(H2Error.Cancel.toRst(1), ping)))
+              _ <- awaitPing(output).timeout(2.seconds)
+              _ <- stopped.get.timeout(2.seconds)
+              _ <- input.offer(
+                frameBytes(List(H2Frame.Headers(3, None, true, true, headers, None)))
+              )
+              _ <- awaitResponseEnd(output, 3)
+              frames <- observed.get
+              count <- pushes.get
+              logs <- logger.logged
+              promise = frames.indexWhere {
+                case p: H2Frame.PushPromise => p.promisedStreamId == 2; case _ => false
+              }
+              reset = frames.indexOf(H2Error.Cancel.toRst(2))
+              _ = assert(promise >= 0 && reset > promise, clue(frames))
+              _ = assertEquals(count, 2)
+              _ = assertEquals(logs.collect { case e: TestingLogger.ERROR => e }, Vector.empty)
             } yield ()
           }
       } yield ()

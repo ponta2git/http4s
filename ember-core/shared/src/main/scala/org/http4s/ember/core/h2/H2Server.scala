@@ -38,7 +38,7 @@ import H2Frame.Settings.ConnectionSettings.{default => defaultSettings}
 
 private[ember] object H2Server {
 
-  private[h2] def discardResponseBody[F[_]: Concurrent](body: EntityBody[F]): F[Unit] = {
+  private[ember] def discardResponseBody[F[_]: Concurrent](body: EntityBody[F]): F[Unit] = {
     val F = Concurrent[F]
     // Keep cancellation masked while fs2 registers the body's resource scopes. Polling
     // ordinary effects cancels before they run, while nested acquisition and release
@@ -128,13 +128,36 @@ private[ember] object H2Server {
       idleTimeout: Duration,
       localSettings: H2Frame.Settings.ConnectionSettings,
       logger: Logger[F],
+  )(implicit F: Async[F]): Resource[F, Unit] =
+    fromSocket(socket, httpApp, receiveHeadersTimeout, idleTimeout, localSettings, logger, F.never)
+
+  def fromSocket[F[_]](
+      socket: Socket[F],
+      httpApp: HttpApp[F],
+      receiveHeadersTimeout: Duration,
+      idleTimeout: Duration,
+      localSettings: H2Frame.Settings.ConnectionSettings,
+      logger: Logger[F],
+      shutdown: F[Unit],
   )(implicit F: Async[F]): Resource[F, Unit] = {
 
     val initialRemoteSettings =
       defaultSettings.copy(maxConcurrentStreams = H2Frame.Settings.SettingsMaxConcurrentStreams(-1))
 
     def holdWhileOpen(stateRef: Ref[F, H2Connection.State[F]]): F[Unit] =
-      F.sleep(1.seconds) >> stateRef.get.map(_.closed).ifM(F.unit, holdWhileOpen(stateRef))
+      F.sleep(1.second) >> stateRef.get.map(_.closed).ifM(F.unit, holdWhileOpen(stateRef))
+
+    def awaitDrained(h2: H2Connection[F], activeHandlers: Ref[F, Int]): F[Unit] =
+      h2.mapRef.get
+        .flatMap(_.values.toList.traverse(_.state.get.map(_.state)))
+        .flatMap(states => activeHandlers.get.tupleLeft(states))
+        .flatMap { case (states, active) =>
+          if (active == 0 && states.forall(_ == H2Stream.StreamState.Closed))
+            // END_STREAM changes stream state when queued. Wait for the socket write
+            // before ending the connection's Resource and canceling its writer.
+            h2.flushWrites >> h2.state.update(_.copy(closed = true))
+          else F.sleep(10.millis) >> awaitDrained(h2, activeHandlers)
+        }
 
     def initH2Connection: F[H2Connection[F]] = for {
       ref <- Concurrent[F].ref(Map[Int, H2Stream[F]]())
@@ -194,87 +217,113 @@ private[ember] object H2Server {
         maxStreams: Semaphore[F],
     ): F[Unit] = {
       def fulfillPushPromises(resp: Response[F]): F[Unit] = {
-        def sender(req: Request[Pure]): F[(Request[Pure], H2Stream[F])] =
-          h2.streamCreateAndHeaders.use[(Request[Pure], H2Stream[F])](_ =>
-            h2.initiateLocalStream.flatMap { stream =>
-              stream
-                .sendPushPromise(streamIx, PseudoHeaders.requestToHeaders(req))
-                .map(_ => (req, stream))
-            }
-          )
+        def sender(req: Request[Pure]): Resource[F, H2Stream[F]] =
+          Resource.makeFull[F, H2Stream[F]] { poll =>
+            poll(h2.streamCreateAndHeaders.use { _ =>
+              F.uncancelable { poll =>
+                poll(h2.initiateLocalStream).flatMap { stream =>
+                  poll(stream.sendPushPromise(streamIx, PseudoHeaders.requestToHeaders(req)))
+                    .as(stream)
+                    .onCancel(stream.rstStream(H2Error.Cancel))
+                }
+              }
+            })
+          }(_.rstStream(H2Error.Cancel))
 
         def respond(req: Request[Pure], stream: H2Stream[F]): F[Unit] =
-          responseResource(httpApp(req.covary[F])).use { case (pushedResponse, beforeBody) =>
-            val noContent = req.method == Method.HEAD || !pushedResponse.status.isEntityAllowed
-            if (pushedResponse.status.code < 200) stream.rstStream(H2Error.InternalError)
-            else
-              stream.sendHeaders(
-                PseudoHeaders.responseToHeaders(pushedResponse),
-                endStream = noContent,
-              ) >>
-                (stream.sendMessageBody(pushedResponse, beforeBody) >> stream.sendTrailerHeaders(
-                  pushedResponse
-                )).unlessA(noContent)
-          }
+          F.race(
+            stream.awaitCancellation,
+            responseResource(httpApp(req.covary[F])).use { case (pushedResponse, beforeBody) =>
+              val noContent = req.method == Method.HEAD || !pushedResponse.status.isEntityAllowed
+              if (pushedResponse.status.code < 200) stream.rstStream(H2Error.InternalError)
+              else
+                stream.sendHeaders(
+                  PseudoHeaders.responseToHeaders(pushedResponse),
+                  endStream = noContent,
+                ) >>
+                  (stream.sendMessageBody(pushedResponse, beforeBody) >> stream.sendTrailerHeaders(
+                    pushedResponse
+                  )).unlessA(noContent)
+            },
+          ).void
 
-        resp.attributes.lookup(H2Keys.PushPromises).traverse_ { (l: List[Request[Pure]]) =>
-          h2.state.get.flatMap {
-            case s
-                if s.remoteSettings.enablePush.isEnabled && s.remoteSettings.maxConcurrentStreams.maxConcurrency != 0 =>
-              l.filter(req =>
-                (req.method == Method.GET || req.method == Method.HEAD) && req.contentLength
-                  .forall(_ == 0)
-              ).traverse_(req => sender(req).flatMap { case (req, stream) => respond(req, stream) })
-            case _ => Applicative[F].unit
+        resp.attributes
+          .lookup(H2Keys.PushPromises)
+          .traverse_ { (l: List[Request[Pure]]) =>
+            h2.state.get.flatMap {
+              case s
+                  if s.draining.isEmpty && s.remoteSettings.enablePush.isEnabled && s.remoteSettings.maxConcurrentStreams.maxConcurrency != 0 =>
+                l.filter(req =>
+                  (req.method == Method.GET || req.method == Method.HEAD) && req.contentLength
+                    .forall(_ == 0)
+                ).traverse_(req => sender(req).use(stream => respond(req, stream)))
+              case _ => Applicative[F].unit
+            }
           }
-        }
+          .recoverWith { case error: H2Connection.KillWithoutMessage =>
+            // Shutdown may start after the check above while waiting for push capacity.
+            // Skip the new push, while still completing the accepted parent response.
+            h2.state.get.flatMap(s => if (s.draining.isDefined) F.unit else F.raiseError(error))
+          }
       }
 
-      h2.mapRef.get.map(_.get(streamIx)).map(_.get).flatMap { stream =>
-        val permit =
-          if (streamIx % 2 != 0) maxStreams.tryPermit else Resource.pure[F, Boolean](true)
+      h2.mapRef.get.flatMap(
+        _.get(streamIx).traverse_ { stream =>
+          val permit =
+            if (streamIx % 2 != 0) maxStreams.permit else Resource.unit[F]
 
-        permit.use {
-          case true =>
-            for {
-              req <- stream.getRequest.map(_.covary[F].withBodyStream(stream.readBody))
-              _ <- responseResource(httpApp(req)).use { case (resp, beforeBody) =>
-                val noContent = req.method == Method.HEAD || !resp.status.isEntityAllowed
-                if (resp.status.code < 200) stream.rstStream(H2Error.InternalError)
-                else
-                  fulfillPushPromises(resp).whenA(noContent) >> stream.sendHeaders(
-                    PseudoHeaders.responseToHeaders(resp),
-                    endStream = noContent,
-                  ) >>
-                    fulfillPushPromises(resp).unlessA(noContent) >>
-                    (stream.sendMessageBody(resp, beforeBody) >> stream.sendTrailerHeaders(resp))
-                      .unlessA(noContent)
-              }
-              _ <- stream.state.get.flatMap { streamState =>
-                // The response no longer owns a request body consumer. RFC 9113, section 8.1
-                // permits NO_ERROR after the complete response when the request is unfinished.
-                stream
-                  .rstStream(H2Error.NoError)
-                  .whenA(streamState.state == H2Stream.StreamState.HalfClosedLocal) >>
-                  // Final DATA may already have closed the stream while blocked on this buffer.
-                  streamState.readBuffer.close.void
-              }
-              _ <- h2.mapRef.update(_ - streamIx)
-            } yield ()
+          F.race(
+            stream.awaitCancellation,
+            permit.use { _ =>
+              for {
+                req <- stream.getRequest.map(_.covary[F].withBodyStream(stream.readBody))
+                _ <- responseResource(httpApp(req)).use { case (resp, beforeBody) =>
+                  val noContent = req.method == Method.HEAD || !resp.status.isEntityAllowed
+                  if (resp.status.code < 200) stream.rstStream(H2Error.InternalError)
+                  else
+                    fulfillPushPromises(resp).whenA(noContent) >> stream.sendHeaders(
+                      PseudoHeaders.responseToHeaders(resp),
+                      endStream = noContent,
+                    ) >>
+                      fulfillPushPromises(resp).unlessA(noContent) >>
+                      (stream.sendMessageBody(resp, beforeBody) >> stream.sendTrailerHeaders(
+                        resp
+                      ))
+                        .unlessA(noContent)
+                }
+                _ <- stream.state.get.flatMap { streamState =>
+                  // The response no longer owns a request body consumer. RFC 9113, section 8.1
+                  // permits NO_ERROR after the complete response when the request is unfinished.
+                  stream
+                    .rstStream(H2Error.NoError)
+                    .whenA(streamState.state == H2Stream.StreamState.HalfClosedLocal) >>
+                    // Final DATA may already have closed the stream while blocked on this buffer.
+                    streamState.readBuffer.close.void
+                }
+              } yield ()
 
-          case false => stream.rstStream(H2Error.RefusedStream)
+            },
+          ).void
+            .onError {
+              case _: CancellationException => F.unit
+              case _ => stream.rstStream(H2Error.InternalError)
+            }
+            .guarantee(h2.mapRef.update(_ - streamIx))
         }
-      }
+      )
     }
 
-    def processCreatedStreams(h2: H2Connection[F], maxStreams: Semaphore[F]): F[Unit] =
+    def processCreatedStreams(
+        h2: H2Connection[F],
+        maxStreams: Semaphore[F],
+        activeHandlers: Ref[F, Int],
+    ): F[Unit] =
       Stream
         .fromQueueUnterminated(h2.createdStreams)
         .parEvalMapUnbounded(i =>
-          processCreatedStream(h2, i, maxStreams)
-            .onError { case _ =>
-              h2.mapRef.get.flatMap(_.get(i).traverse_(_.rstStream(H2Error.InternalError)))
-            }
+          Resource
+            .make(activeHandlers.update(_ + 1))(_ => activeHandlers.update(_ - 1))
+            .use(_ => processCreatedStream(h2, i, maxStreams))
             .handleErrorWith {
               case e: CancellationException =>
                 logger.debug(e)("Stream canceled before processing")
@@ -298,9 +347,15 @@ private[ember] object H2Server {
       maxStreams <- Resource.eval(
         Semaphore[F](localSettings.maxConcurrentStreams.maxConcurrency.toLong)
       )
+      activeHandlers <- Resource.eval(Ref.of[F, Int](0))
       _ <- clearClosedStreams(h2).background
-      _ <- processCreatedStreams(h2, maxStreams).background
-      _ <- Resource.eval(holdWhileOpen(h2.state))
+      _ <- processCreatedStreams(h2, maxStreams, activeHandlers).background
+      _ <- Resource.eval(
+        F.race(
+          holdWhileOpen(h2.state),
+          shutdown >> h2.beginGracefulShutdown >> awaitDrained(h2, activeHandlers),
+        ).void
+      )
     } yield ()
   }
 }

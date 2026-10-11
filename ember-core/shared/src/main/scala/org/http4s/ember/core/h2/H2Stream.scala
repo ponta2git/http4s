@@ -50,8 +50,18 @@ private[h2] class H2Stream[F[_]: Temporal](
     val goAway: H2Error => F[Unit],
     private[this] val logger: Logger[F],
     control: Option[cats.effect.std.Queue[F, Chunk[H2Frame]]] = None,
+    canceled: Option[Deferred[F, Unit]] = None,
+    discardData: Option[Deferred[F, Unit]] = None,
+    enqueueData: Option[H2Frame.Data => F[Unit]] = None,
 ) {
   import H2Stream.{DataReceiveResult, StreamState, WindowUpdateResult}
+
+  // Separate from request/body completion: a handler can be suspended in arbitrary effects.
+  def awaitCancellation: F[Unit] = canceled.fold(Temporal[F].never[Unit])(_.get)
+
+  private def signalCancellation: F[Unit] = canceled.traverse_(_.complete(()).void)
+
+  private def discardPendingData: F[Unit] = discardData.traverse_(_.complete(()).void)
 
   private def withHpackErrorHandling[A](fa: F[A]): F[A] =
     fa.onError {
@@ -211,7 +221,7 @@ private[h2] class H2Stream[F[_]: Temporal](
                 }
               }
             }
-          case _ => new IllegalStateException("Stream Was Closed").raiseError
+          case _ => new CancellationException("Stream was closed").raiseError
         }
       }
 
@@ -246,7 +256,7 @@ private[h2] class H2Stream[F[_]: Temporal](
           }
         }
         .flatMap {
-          case (_, -2) => new IllegalStateException("Stream Was Closed").raiseError[F, Unit]
+          case (_, -2) => new CancellationException("Stream was closed").raiseError[F, Unit]
           case (s, -1) =>
             Temporal[F].monotonic
               .flatMap { now =>
@@ -269,7 +279,8 @@ private[h2] class H2Stream[F[_]: Temporal](
           case (_, count) =>
             val (head, tail) = bv.splitAt(count.toLong)
             val terminal = tail.isEmpty && endStream
-            poll(enqueue.offer(Chunk.singleton(H2Frame.Data(id, head, None, terminal)))) >>
+            val frame = H2Frame.Data(id, head, None, terminal)
+            poll(enqueueData.fold(enqueue.offer(Chunk.singleton(frame)))(_(frame))) >>
               (if (terminal)
                  state
                    .modify { s =>
@@ -526,6 +537,13 @@ private[h2] class H2Stream[F[_]: Temporal](
 
   def rstStream(error: H2Error): F[Unit] = {
     val rst = error.toRst(id)
+    // Locally created streams must be introduced by HEADERS/PUSH_PROMISE before a reset.
+    // NO_ERROR can follow a completed early response and must stay after its END_STREAM.
+    val local = connectionType match {
+      case H2Connection.ConnectionType.Client => id % 2 != 0
+      case H2Connection.ConnectionType.Server => id % 2 == 0
+    }
+    val outgoing = if (local || error == H2Error.NoError) enqueue else control.getOrElse(enqueue)
     state
       .modify {
         case s if s.state == StreamState.Closed => (s, None)
@@ -533,9 +551,13 @@ private[h2] class H2Stream[F[_]: Temporal](
       }
       .flatMap {
         case Some(s) =>
-          enqueue.offer(Chunk.singleton(rst)) >>
+          discardPendingData.whenA(error != H2Error.NoError) >>
             s.cancelWith(s"Sending RstStream, cancelling: $rst") >>
-            onClosed
+            onClosed >>
+            Temporal[F].guarantee(
+              outgoing.offer(Chunk.singleton(rst)).unlessA(local && s.state == StreamState.Idle),
+              signalCancellation,
+            )
         case None => Applicative[F].unit
       }
   }
@@ -543,8 +565,8 @@ private[h2] class H2Stream[F[_]: Temporal](
   // Broadcast Frame
   // Will eventually allow us to know we can retry if we are above the processed window declared
   def receiveGoAway(goAway: H2Frame.GoAway): F[Unit] =
-    state.modify(s => (s.copy(state = StreamState.Closed), s)).flatMap { s =>
-      (s.cancelWith(s"Received GoAway, cancelling: $goAway") >> onClosed)
+    discardPendingData >> state.modify(s => (s.copy(state = StreamState.Closed), s)).flatMap { s =>
+      (s.cancelWith(s"Received GoAway, cancelling: $goAway") >> onClosed >> signalCancellation)
         .whenA(s.state != StreamState.Closed)
     }
 
@@ -558,8 +580,9 @@ private[h2] class H2Stream[F[_]: Temporal](
       .flatMap {
         case Left(_) => goAway(H2Error.ProtocolError)
         case Right(Some(s)) =>
-          s.cancelWith(s"Received RstStream, cancelling: $rst") >> onClosed
-        case Right(None) => Applicative[F].unit
+          discardPendingData >>
+            s.cancelWith(s"Received RstStream, cancelling: $rst") >> onClosed >> signalCancellation
+        case Right(None) => discardPendingData >> signalCancellation
       }
 
   // Important for telling folks we can send more data

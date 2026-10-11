@@ -1235,4 +1235,227 @@ class H2ConnectionSuite extends Http4sSuite {
     }
   }
 
+  test("graceful GOAWAY bypasses stalled DATA without canceling accepted streams") {
+    TestControl.executeEmbed {
+      for {
+        output <- Ref.of[IO, ByteVector](ByteVector.empty)
+        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        socket <- testSocket(ByteVector.empty, bytes => output.update(_ ++ bytes.toByteVector))
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+          idleTimeout = 5.seconds,
+          controlOverride = Some(control),
+        )
+        stream <- h2.initiateRemoteStreamById(1)
+        _ <- stream.state.update(_.copy(state = H2Stream.StreamState.HalfClosedRemote))
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        _ <- h2.writeLoop.compile.drain.background.use { _ =>
+          for {
+            _ <- h2.outgoing.offer(dataFrame(1))
+            _ <- IO.sleep(1.second)
+            _ <- h2.beginGracefulShutdown.timeout(1.second)
+            frames <- output.get.map(decodeFrames)
+            active <- stream.state.get.map(_.state)
+            closed <- h2.state.get.map(_.closed)
+            _ = assertEquals(frames, Vector(H2Error.NoError.toGoAway(1)))
+            _ = assertEquals(active, H2Stream.StreamState.HalfClosedRemote)
+            _ = assert(!closed)
+            _ <- increaseWindowSize(h2, 1)
+            _ <- h2.flushWrites.timeout(1.second)
+            sent <- output.get.map(decodeFrames)
+            _ = assert(sent.exists(_.isInstanceOf[H2Frame.Data]))
+          } yield ()
+        }
+      } yield ()
+    }
+  }
+
+  test("write flush waits for the socket write, not merely an empty outgoing queue") {
+    TestControl.executeEmbed {
+      for {
+        started <- Deferred[IO, Unit]
+        release <- Deferred[IO, Unit]
+        flushed <- Deferred[IO, Unit]
+        socket <- testSocket(ByteVector.empty, _ => started.complete(()).void >> release.get)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+        )
+        _ <- h2.writeLoop.compile.drain.background.use { _ =>
+          h2.outgoing.offer(dataFrame(1)) >> started.get >>
+            (h2.flushWrites >> flushed.complete(())).background.use { _ =>
+              IO.sleep(1.second) >> flushed.tryGet.flatMap(value =>
+                IO(assertEquals(value, None))
+              ) >>
+                release.complete(()) >> flushed.get.timeout(1.second)
+            }
+        }
+      } yield ()
+    }
+  }
+
+  test("graceful shutdown refuses new requests while still decoding their HPACK blocks") {
+    for {
+      encoder <- Hpack.create[IO](1024)
+      fields = NonEmptyList.of(
+        (":method", "GET", false),
+        (":scheme", "https", false),
+        (":path", "/", false),
+        ("x-dynamic", "value", false),
+      )
+      first <- encoder.encodeHeaders(fields)
+      second <- encoder.encodeHeaders(fields)
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(
+          H2Frame.Headers(1, None, true, true, first, None),
+          H2Frame.Headers(3, None, true, true, second, None),
+        ),
+      )
+      _ <- h2.state.update(_.copy(draining = Some(0)))
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+      created <- h2.createdStreams.tryTake
+    } yield {
+      assertEquals(frames, Vector(H2Error.RefusedStream.toRst(1), H2Error.RefusedStream.toRst(3)))
+      assertEquals(created, None)
+    }
+  }
+
+  test("simultaneous normal and control queue arrivals are both written") {
+    TestControl.executeEmbed {
+      for {
+        written <- Queue.unbounded[IO, H2Frame]
+        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        socket <- testSocket(
+          ByteVector.empty,
+          bytes => decodeFrames(bytes.toByteVector).toList.traverse_(written.offer),
+        )
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+          controlOverride = Some(control),
+        )
+        _ <- h2.writeLoop.compile.drain.background.use { _ =>
+          (for {
+            _ <- (
+              control.offer(Chunk.singleton(H2Frame.Ping.ack)),
+              h2.outgoing.offer(dataFrame(1)),
+            ).parTupled
+            first <- written.take.timeout(1.second)
+            second <- written.take.timeout(1.second)
+            _ = assertEquals(Set(first, second), Set[H2Frame](H2Frame.Ping.ack, dataFrame(1)(0)))
+          } yield ()).replicateA_(100)
+        }
+      } yield ()
+    }
+  }
+
+  test("reset discards held and queued DATA after request cleanup without consuming new credit") {
+    TestControl.executeEmbed {
+      for {
+        output <- Ref.of[IO, ByteVector](ByteVector.empty)
+        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        socket <- testSocket(ByteVector.empty, bytes => output.update(_ ++ bytes.toByteVector))
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+          idleTimeout = 10.seconds,
+          controlOverride = Some(control),
+        )
+        first <- h2.initiateRemoteStreamById(1)
+        next <- h2.initiateRemoteStreamById(3)
+        _ <- List(first, next).traverse_(
+          _.state.update(_.copy(state = H2Stream.StreamState.HalfClosedRemote))
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        _ <- h2.writeLoop.compile.drain.background.use { _ =>
+          for {
+            _ <- first.sendData(ByteVector.fill(2)(1), endStream = false)
+            _ <- IO.sleep(1.second)
+            _ <- first.sendData(ByteVector.fill(3)(1), endStream = false)
+            _ <- first.sendData(ByteVector.fill(4)(1), endStream = false)
+            _ <- first.receiveRstStream(H2Error.Cancel.toRst(1))
+            _ <- h2.mapRef.update(_ - 1)
+            _ <- control.offer(Chunk.singleton(H2Frame.Ping.ack))
+            _ <- next.sendHeaders(NonEmptyList.one((":status", "200", false)), endStream = false)
+            _ <- next.sendData(ByteVector.fill(2)(3), endStream = true)
+            _ <- increaseWindowSize(h2, 2)
+            _ <- h2.flushWrites.timeout(1.second)
+            frames <- output.get.map(decodeFrames)
+            pending <- h2.state.get.map(_.pendingData)
+            _ = assert(frames.contains(H2Frame.Ping.ack), clue(frames))
+            _ = assertEquals(
+              frames.collect { case d: H2Frame.Data => (d.identifier, d.data) },
+              Vector((3, ByteVector.fill(2)(3))),
+            )
+            _ = assert(frames.exists {
+              case h: H2Frame.Headers => h.identifier == 3; case _ => false
+            })
+            _ = assert(pending.isEmpty)
+          } yield ()
+        }
+      } yield ()
+    }
+  }
+
+  test("NO_ERROR reset preserves a normally completed response queued before request cleanup") {
+    TestControl.executeEmbed {
+      for {
+        output <- Ref.of[IO, ByteVector](ByteVector.empty)
+        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        socket <- testSocket(ByteVector.empty, bytes => output.update(_ ++ bytes.toByteVector))
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+          controlOverride = Some(control),
+        )
+        stream <- h2.initiateRemoteStreamById(1)
+        _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Open))
+        _ <- stream.sendData(ByteVector.fill(3)(1), endStream = true)
+        _ <- stream.rstStream(H2Error.NoError)
+        _ <- h2.mapRef.update(_ - 1)
+        _ <- h2.writeLoop.compile.drain.background.use(_ => h2.flushWrites.timeout(1.second))
+        frames <- output.get.map(decodeFrames)
+        pending <- h2.state.get.map(_.pendingData)
+      } yield {
+        assertEquals(
+          frames,
+          Vector[H2Frame](
+            H2Frame.Data(1, ByteVector.fill(3)(1), None, true),
+            H2Error.NoError.toRst(1),
+          ),
+        )
+        assert(pending.isEmpty)
+      }
+    }
+  }
+
+  test("canceling a DATA offer to a full queue releases its pending bookkeeping") {
+    TestControl.executeEmbed {
+      for {
+        outgoing <- Queue.bounded[IO, Chunk[H2Frame]](1)
+        _ <- outgoing.offer(Chunk.singleton(H2Frame.Ping.ack))
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          outgoingOverride = Some(outgoing),
+        )
+        stream <- h2.initiateRemoteStreamById(1)
+        _ <- stream.state.update(_.copy(state = H2Stream.StreamState.HalfClosedRemote))
+        _ <- stream.sendData(ByteVector.fill(1)(1), endStream = false).background.use { _ =>
+          IO.sleep(1.second) >> h2.state.get
+            .map(s => assertEquals(s.pendingData.get(1).map(_._2), Some(1)))
+        }
+        pending <- h2.state.get.map(_.pendingData)
+      } yield assert(pending.isEmpty)
+    }
+  }
+
 }

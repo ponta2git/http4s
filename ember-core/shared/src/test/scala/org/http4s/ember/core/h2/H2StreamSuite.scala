@@ -48,12 +48,15 @@ class H2StreamSuite extends Http4sSuite {
       hpackOverride: Option[Hpack[IO]] = None,
       id: Int = 1,
       outgoingOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
+      controlOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
+      discardDataOverride: Option[Deferred[IO, Unit]] = None,
   ): IO[(H2Stream[IO], Queue[IO, Chunk[H2Frame]])] =
     for {
       writeBlock <- Deferred[IO, Either[Throwable, Unit]]
       req <- Deferred[IO, Either[Throwable, Request[fs2.Pure]]]
       resp <- Deferred[IO, Either[Throwable, Response[fs2.Pure]]]
       trailers <- Deferred[IO, Either[Throwable, Headers]]
+      canceled <- Deferred[IO, Unit]
       readBuffer <- Channel.unbounded[IO, Either[Throwable, ByteVector]]
 
       state <- Ref[IO].of(
@@ -85,8 +88,67 @@ class H2StreamSuite extends Http4sSuite {
         onClosed,
         _ => IO.unit,
         logger,
+        controlOverride,
+        Some(canceled),
+        discardDataOverride,
       )
     } yield (stream, outgoing)
+
+  test("RST_STREAM bypasses a full DATA queue and notifies cancellation") {
+    for {
+      outgoing <- Queue.bounded[IO, Chunk[H2Frame]](1)
+      control <- Queue.bounded[IO, Chunk[H2Frame]](1)
+      blocked = Chunk.singleton[H2Frame](H2Frame.Data(1, ByteVector(1), None, false))
+      _ <- outgoing.offer(blocked)
+      pair <- streamAndQueue(
+        defaultSettings,
+        outgoingOverride = Some(outgoing),
+        controlOverride = Some(control),
+      )
+      (stream, _) = pair
+      _ <- stream.rstStream(H2Error.Cancel).timeout(2.seconds)
+      _ <- stream.awaitCancellation.timeout(2.seconds)
+      reset <- control.take
+      queued <- outgoing.take
+      _ = assertEquals(reset, Chunk.singleton[H2Frame](H2Error.Cancel.toRst(1)))
+      _ = assertEquals(queued, blocked)
+    } yield ()
+  }
+
+  test("a received reset notifies cancellation without a request body consumer") {
+    for {
+      pair <- streamAndQueue(defaultSettings)
+      (stream, _) = pair
+      _ <- stream.receiveRstStream(H2Error.Cancel.toRst(1))
+      _ <- stream.awaitCancellation.timeout(2.seconds)
+    } yield ()
+  }
+
+  test("NO_ERROR after an early response preserves queued response DATA") {
+    for {
+      discard <- Deferred[IO, Unit]
+      pair <- streamAndQueue(defaultSettings, discardDataOverride = Some(discard))
+      (stream, _) = pair
+      _ <- stream.rstStream(H2Error.NoError)
+      discarded <- discard.tryGet
+      _ = assertEquals(discarded, None)
+    } yield ()
+  }
+
+  test("only a peer reset discards DATA after normal local completion") {
+    for {
+      discard <- Deferred[IO, Unit]
+      pair <- streamAndQueue(defaultSettings, discardDataOverride = Some(discard))
+      (stream, _) = pair
+      _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Closed))
+      _ <- stream.rstStream(H2Error.Cancel)
+      afterCleanup <- discard.tryGet
+      _ = assertEquals(afterCleanup, None)
+      _ <- stream.receiveRstStream(H2Error.Cancel.toRst(1))
+      afterPeerReset <- discard.tryGet
+      _ = assertEquals(afterPeerReset, Some(()))
+    } yield ()
+  }
 
   def clientStream(
       config: H2Frame.Settings.ConnectionSettings

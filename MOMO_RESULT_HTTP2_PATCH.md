@@ -7,7 +7,7 @@ repository does not publish a binary artifact for the patch.
 ## Fixed source reference
 
 - Upstream base: `v0.23.37`
-- Patch branch: `main`
+- Patch branch: `master`
 - Original patch commits: `7a01600fc0`, `3935c2a53b`, `02db430fe0`, `2e264bc298`
 
 The patch is not an official http4s release. Consumers should use the fixed
@@ -108,3 +108,53 @@ These deterministic regression tests do not constitute a formal proof of
 complete RFC conformance. No external h2spec run or live HTTP/3 interoperability
 test was performed. JVM TLS parameter tests do not establish all
 provider-specific cipher, renegotiation, or native/JavaScript TLS behavior.
+
+## Lifecycle handoff (2026-10-11)
+
+The momo-result handoff reproduced three failures against `0ff0cbb2f57a`:
+RST_STREAM did not cancel an application suspended outside request-body reads;
+server shutdown did not send GOAWAY during its grace period; and an HTTP/1 HEAD
+response with unknown representation length acquired `Content-Length: 0`.
+
+- Stream cancellation now owns the handler, admission permit, response resource,
+  and any in-progress pushes. Expected peer resets are debug-level cancellation,
+  not application errors. Application errors retain their normal error reporting.
+- Server shutdown freezes the last accepted stream ID and writes NO_ERROR GOAWAY
+  before draining. New requests are refused while their HPACK blocks are consumed.
+  Accepted handlers and response writes finish before connection release; the
+  configured shutdown timeout still bounds unfinished work.
+- HEAD encoding preserves supplied representation metadata and emits no body,
+  chunk terminator, or trailers. It does not infer a representation length from
+  an empty wire body. Suppressed response resources are finalized, and the next
+  response on a persistent connection starts immediately after HEAD's headers.
+- Remote-stream error resets use the control queue, while local stream resets
+  remain ordered after their introducing HEADERS/PUSH_PROMISE. NO_ERROR following
+  an early response remains ordered after END_STREAM. Competing queue reads retain
+  both completed results, avoiding silent frame loss during simultaneous arrivals.
+- Reset DATA is discarded even after the handler's stream-map entry is removed.
+  Cancellation metadata is retained only for outstanding DATA offers and writes,
+  then released as frames are sent or discarded. Reset notification wakes a writer
+  waiting for connection credit, so a canceled body cannot spend new credit or
+  block a later response. Normal early-response NO_ERROR retains its queued body.
+
+The shutdown behavior follows [RFC 9113 §6.8](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.8).
+HEAD metadata and framing follow [RFC 9110 §8.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6)
+and [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3).
+
+Validation of this handoff:
+
+- JVM Scala 3.3.6: Ember core/server/client passed 256/48/34 tests (two existing
+  ignored tests); all three modules passed MiMa. The affected suites passed again
+  after the final shutdown/push adjustment.
+- Scala.js: 109 connection/stream tests passed. Scala 2.13.18: 123
+  connection/stream/server-body tests passed. Scala Native Ember core and Scala
+  2.12.21 Ember core/server compiled successfully.
+- The original momo-result `run.sh` failed all three probes against `0ff0cbb2f57a`
+  and passed all three against locally published revised core/server/Ember
+  artifacts. The corrected run no longer logged the pre-response reset error.
+
+For the supplied handoff scripts, locally publish `core`, `server`, `ember-core`,
+and `ember-server` with Scala 3.3.6, then pass the generated fork version as the
+argument to `/private/tmp/momo-http2-handoff/run.sh`. Validation used the temporary
+version `0.23.37-momo-handoff-validation-SNAPSHOT`; applications should pin the
+clean commit-derived version described above instead.

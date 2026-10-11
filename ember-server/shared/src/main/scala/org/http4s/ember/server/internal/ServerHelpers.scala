@@ -19,6 +19,7 @@ package org.http4s.ember.server.internal
 import cats._
 import cats.effect._
 import cats.effect.kernel.Resource
+import cats.effect.syntax.all._
 import cats.syntax.all._
 import com.comcast.ip4s._
 import fs2.Stream
@@ -233,6 +234,7 @@ private[server] object ServerHelpers extends ServerHelpersPlatform {
                           idleTimeout,
                           h2FrameSettings,
                           logger,
+                          shutdown.signal,
                         )
                     )
                     .drain
@@ -291,6 +293,7 @@ private[server] object ServerHelpers extends ServerHelpersPlatform {
                               idleTimeout,
                               h2FrameSettings,
                               logger,
+                              shutdown.signal,
                             )
                           )
                           .drain
@@ -427,15 +430,19 @@ private[server] object ServerHelpers extends ServerHelpersPlatform {
       resp: Response[F],
       idleTimeout: Duration,
       onWriteFailure: (Option[Request[F]], Response[F], Throwable) => F[Unit],
-  ): F[Unit] =
-    Encoder
-      .respToBytes[F](resp)
+  ): F[Unit] = {
+    val isHead = request.exists(_.method == Method.HEAD)
+    val write = Encoder
+      .respToBytes[F](resp, 32 * 1024, isHead)
       .through(_.chunks.foreach(c => timeoutMaybe(socket.write(c), idleTimeout)))
       .compile
       .drain
       .onError { case err =>
         onWriteFailure(request, resp, err)
       }
+    if (isHead) write.guarantee(H2Server.discardResponseBody(resp.body))
+    else write
+  }
 
   private[internal] def postProcessResponse[F[_]: Concurrent: Clock](
       req: Request[F],

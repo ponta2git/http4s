@@ -37,6 +37,13 @@ private[ember] object Encoder {
   def respToBytes[F[_]: Applicative](
       resp: Response[F],
       writeBufferSize: Int = 32 * 1024,
+  ): Stream[F, Byte] =
+    respToBytes(resp, writeBufferSize, isHead = false)
+
+  def respToBytes[F[_]: Applicative](
+      resp: Response[F],
+      writeBufferSize: Int,
+      isHead: Boolean,
   ): Stream[F, Byte] = {
     var chunked = resp.isChunked
     // resp.status.isEntityAllowed TODO
@@ -63,7 +70,9 @@ private[ember] object Encoder {
       }
 
       def isEmptyBody = resp.body eq EmptyBody
-      def isEntityAllowed = resp.status.isEntityAllowed
+      // HEAD metadata describes the corresponding GET representation. Its empty
+      // wire body does not imply a representation length of zero (RFC 9110, 8.6).
+      def isEntityAllowed = !isHead && resp.status.isEntityAllowed
       if (!appliedContentLength && isEmptyBody && isEntityAllowed) {
         stringBuilder.append(zeroContentLengthRaw).append(CRLF)
         chunked = false
@@ -76,7 +85,9 @@ private[ember] object Encoder {
       stringBuilder.toString.getBytes(StandardCharsets.ISO_8859_1)
     }
 
-    if (chunked)
+    if (isHead)
+      Stream.chunk(Chunk.array(initSection))
+    else if (chunked)
       Stream.chunk(Chunk.array(initSection)) ++ resp.body.through(
         ChunkedEncoding.encode[F](resp.trailerHeaders)
       )
