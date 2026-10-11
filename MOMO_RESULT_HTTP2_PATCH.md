@@ -35,8 +35,10 @@ settings.
 After sending a complete response, the server closes unconsumed request input.
 If the client has not ended the request, the server sends `RST_STREAM(NO_ERROR)`
 after the response's `END_STREAM`, as permitted by RFC 9113 section 8.1. Closing
-input releases a DATA receiver even when its bounded buffer is full; stream
-resets also complete without waiting for a body consumer. A client retains a
+input releases body readers; stream resets also complete without waiting for a
+body consumer. Receive credit now bounds retained body bytes, and credit is
+replenished when the application consumes them. Empty DATA does not occupy the
+body buffer. A client retains a
 completed response when it receives the subsequent `NO_ERROR` reset.
 
 ## Reproduce from source
@@ -53,3 +55,56 @@ sbt '++3.3.6' core/mimaReportBinaryIssues server/mimaReportBinaryIssues \
 Build the required artifact locally from this checkout and use that artifact
 in the application. Keep the upstream LICENSE and NOTICE files with any
 distributed copy.
+
+## RFC review (2026-10-11)
+
+The implementation reviewed here is Ember HTTP/2. The repository has an
+`HTTP/3` version constant, but no HTTP/3 transport, QUIC, or QPACK implementation.
+[RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html) therefore supplies context
+for shared HTTP semantics, not an HTTP/3 conformance claim. The version constant's
+reference now points to that final RFC.
+
+The changes address the following concrete defects against
+[RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html) and
+[RFC 7541](https://www.rfc-editor.org/rfc/rfc7541.html):
+
+| Area | Defect and correction | RFC sections |
+| --- | --- | --- |
+| Frame parsing | Truncated fixed fields could throw; signed padding and dependency octets were misread. Check sizes before indexing, decode unsigned octets, and reject invalid stream IDs and padding. | 9113 §§4, 6 |
+| Connection preface | A partial socket read was treated as an invalid preface. Accumulate matching bytes under one timeout; require the peer's first frame to be non-ACK SETTINGS. Send the client's SETTINGS before starting its reader. | 9113 §3.4 |
+| Settings | Correct the maximum initial window to 2^31−1, apply repeated settings in wire order, reject a server enabling push, advertise the local concurrency limit, and apply the peer's HPACK table limit. | 9113 §§6.5, 6.9.2; 7541 §4.2 |
+| Header fields | Validate names, values, pseudo-header order/uniqueness/context, all TE occurrences, and Content-Length syntax. Reject CR/LF/NUL and ambiguous framing; remove Connection-nominated outgoing fields. | 9113 §§8.1.1, 8.2, 8.3 |
+| Request target | Parse authority as authority rather than a relative URI; reject userinfo and mismatching Host; validate path and scheme; implement ordinary CONNECT's pseudo-header shape. Combine split Cookie fields before application delivery. | 9113 §§8.2.3, 8.3.1, 8.5 |
+| Response sequence | Keep informational responses separate from the final response; reject 101 and terminal 1xx; reject DATA before final response headers, invalid trailers, and trailers without END_STREAM. | 9113 §§8.1, 8.3.2 |
+| Message length | Check Content-Length on terminal HEADERS as well as DATA, and reject excess bytes before END_STREAM. HEAD/204/304 metadata is not mistaken for a required body; successful CONNECT switches to tunnel framing. Suppress server response bodies where content is forbidden. | 9113 §§8.1.1, 8.5 |
+| HPACK | Empty field sections are legal trailers. Detect truncated representations and table updates after fields before invoking the incremental decoder; emit pending minimum/final table-size updates before subsequent encoded fields. | 7541 §§4.2, 5, 6 |
+| Header fragmentation | Split outbound HEADERS and PUSH_PROMISE using the peer frame limit, preserve END_STREAM on HEADERS, and enqueue each complete CONTINUATION sequence together under the encoder lock. | 9113 §§4.3, 6.2, 6.6, 6.10 |
+| Flow control | Reserve stream credit atomically before enqueueing DATA; split DATA to available connection credit. Replenish stream credit on consumption and route connection control frames independently of blocked DATA. Socket reads no longer depend on a possibly zero stream window. | 9113 §§5.2, 6.9 |
+| Stream lifecycle | Enforce remote stream concurrency, reject unreserved server streams and disabled push, stop local stream creation after GOAWAY or ID exhaustion, and release waiters/watchdogs on connection termination. Closed cached connections are removed only if still owned by that cache entry. | 9113 §§5.1, 5.4, 6.8 |
+| Push | Reject unsafe/body-bearing promised requests and promises outside the connection's origin before invoking the client callback. Release failed push entries and respect the peer's concurrency when producing pushes. | 9113 §8.4 |
+| Resource limits | Bound empty CONTINUATION sequences by frame count, enforce compressed-block limits on unfragmented blocks too, and keep decoded header limits independent of compressed size. | 9113 §§10.5, 10.5.1 |
+| TLS (JVM) | Restrict protocols to supported TLS 1.2/1.3 versions, exclude static-key-exchange/non-AEAD TLS 1.2 suites, and choose only ALPN protocols actually offered by the peer. Preserve the caller's authentication and endpoint-validation parameters. | 9113 §§3.2, 9.2 |
+
+Regression coverage includes short payloads across all known frame types and all
+256 flag values, padding boundaries 0/127/128/255, malformed field sections,
+HPACK truncation and table updates, interim responses, trailers, HEAD metadata,
+flow-control races, stalled DATA with live control frames, preface fragmentation,
+connection EOF, and continuation flooding. Existing tests with malformed response
+fields or assumptions about cross-stream completion order were corrected.
+
+Validation: Scala 3.3.6 JVM Ember core/server/client passed 243/39/34 tests
+respectively (two existing core tests remain ignored). MiMa passed for all three
+modules. Additional checks during the review passed: 175 HTTP/2 tests on Scala
+2.13.18, 53 frame/header/HPACK tests on Scala.js, and compilation on Scala 2.12.21
+and Scala Native. The final JVM checks are reproducible with:
+
+```bash
+sbt '++3.3.6' 'ember-core/test' 'ember-server/test' 'ember-client/test' \
+  'ember-core/mimaReportBinaryIssues' 'ember-server/mimaReportBinaryIssues' \
+  'ember-client/mimaReportBinaryIssues'
+```
+
+These deterministic regression tests do not constitute a formal proof of
+complete RFC conformance. No external h2spec run or live HTTP/3 interoperability
+test was performed. JVM TLS parameter tests do not establish all
+provider-specific cipher, renegotiation, or native/JavaScript TLS behavior.

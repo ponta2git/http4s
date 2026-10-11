@@ -34,7 +34,9 @@ private[h2] trait Hpack[F[_]] {
   def encodeHeadersWith[A](headers: NonEmptyList[(String, String, Boolean)])(
       send: ByteVector => F[A]
   ): F[A]
-  def decodeHeaders(bv: ByteVector): F[NonEmptyList[(String, String)]]
+  def updateEncoderTableSize(size: Int): F[Unit]
+
+  def decodeHeaders(bv: ByteVector): F[List[(String, String)]]
 
   /** Advances HPACK decoder state without materializing a field list. */
   def decodeHeadersAndDiscard(bv: ByteVector): F[Unit]
@@ -48,19 +50,28 @@ private[h2] object Hpack extends HpackPlatform {
     eLock <- Mutex[F]
     eFailed <- Ref.of[F, Boolean](false)
     dLock <- Mutex[F]
+    pending <- Ref.of[F, List[Int]](Nil)
     e <- Sync[F].delay(new Encoder(4096))
     d <- Sync[F].delay(new Decoder(maxHeaderListSize, 4096))
-  } yield new Impl(eLock, eFailed, onEncodeFailure, e, dLock, d, maxHeaderListSize.toLong)
+  } yield new Impl(eLock, eFailed, onEncodeFailure, pending, e, dLock, d, maxHeaderListSize.toLong)
 
   private class Impl[F[_]: Async](
       encodeLock: Mutex[F],
       encodeFailed: Ref[F, Boolean],
       onEncodeFailure: F[Unit],
+      pendingTableSizes: Ref[F, List[Int]],
       tEncoder: Encoder,
       decodeLock: Mutex[F],
       tDecoder: Decoder,
       maxHeaderListSize: Long,
   ) extends Hpack[F] {
+    def updateEncoderTableSize(size: Int): F[Unit] =
+      encodeLock.lock.surround(pendingTableSizes.update { sizes =>
+        // The encoder may choose a smaller table than the peer's unsigned limit.
+        val limit = math.min(size.toLong & 0xffffffffL, 4096L).toInt
+        List((limit :: sizes).min, limit)
+      })
+
     def encodeHeaders(headers: NonEmptyList[(String, String, Boolean)]): F[ByteVector] =
       encodeHeadersWith(headers)(Async[F].pure(_))
 
@@ -76,8 +87,19 @@ private[h2] object Hpack extends HpackPlatform {
               // Queue offers must remain cancelable when a stalled writer has filled the queue.
               // Once encoding has advanced the dynamic table, losing its block invalidates the
               // connection. Poison the encoder before releasing the lock to any waiting sender.
-              Hpack
-                .encodeHeaders[F](tEncoder, headers.toList)
+              pendingTableSizes
+                .getAndSet(Nil)
+                .flatMap { sizes =>
+                  Sync[F]
+                    .delay {
+                      val out = new ByteVectorOutputStream(16)
+                      sizes.distinct.foreach(tEncoder.setMaxHeaderTableSize(out, _))
+                      out.toByteVector()
+                    }
+                    .flatMap(prefix =>
+                      Hpack.encodeHeaders[F](tEncoder, headers.toList).map(prefix ++ _)
+                    )
+                }
                 .flatMap(bytes => poll(send(bytes)))
                 .guaranteeCase {
                   case Outcome.Succeeded(_) => Async[F].unit
@@ -86,7 +108,7 @@ private[h2] object Hpack extends HpackPlatform {
           }
         }
       }
-    def decodeHeaders(bv: ByteVector): F[NonEmptyList[(String, String)]] =
+    def decodeHeaders(bv: ByteVector): F[List[(String, String)]] =
       decodeLock.lock.surround(Hpack.decodeHeaders[F](tDecoder, bv, maxHeaderListSize))
     def decodeHeadersAndDiscard(bv: ByteVector): F[Unit] =
       decodeLock.lock.surround(Hpack.decodeHeadersAndDiscard[F](tDecoder, bv, maxHeaderListSize))
@@ -97,7 +119,7 @@ private[h2] object Hpack extends HpackPlatform {
       tDecoder: Decoder,
       bv: ByteVector,
       maxHeaderListSize: Long,
-  ): F[NonEmptyList[(String, String)]] = Sync[F].delay {
+  ): F[List[(String, String)]] = Sync[F].delay {
     val buffer = List.newBuilder[(String, String)]
     decodeHeaderBlock(tDecoder, bv, maxHeaderListSize) { (name, value) =>
       buffer.+=(
@@ -108,7 +130,7 @@ private[h2] object Hpack extends HpackPlatform {
       )
     }
     val decoded = buffer.result()
-    NonEmptyList.fromListUnsafe(decoded)
+    decoded
   }
 
   def decodeHeadersAndDiscard[F[_]: Sync](
@@ -123,6 +145,7 @@ private[h2] object Hpack extends HpackPlatform {
       bv: ByteVector,
       maxHeaderListSize: Long,
   )(onHeader: (Array[Byte], Array[Byte]) => Unit): Unit = {
+    validateBlock(bv)
     var decodedSize = 0L
     val listener = new HeaderListener {
       def addHeader(name: Array[Byte], value: Array[Byte], sensitive: Boolean): Unit = {
@@ -139,6 +162,55 @@ private[h2] object Hpack extends HpackPlatform {
     tDecoder.decode(bv.toInputStream, listener)
     if (tDecoder.endHeaderBlock()) {
       throw EmberException.MessageTooLong(maxHeaderListSize.toInt)
+    }
+  }
+
+  // The underlying decoder accepts incremental input and endHeaderBlock resets its parser,
+  // even for incomplete representations. Validate framing before allowing it to mutate state.
+  private def validateBlock(bytes: ByteVector): Unit = {
+    var offset = 0L
+    var fieldsStarted = false
+    def invalid(): Nothing = throw new java.io.IOException("Invalid HPACK field block")
+    def integer(bits: Int): Long = {
+      if (offset >= bytes.size) invalid()
+      val mask = (1 << bits) - 1
+      var value = (bytes(offset) & mask).toLong
+      offset += 1
+      if (value == mask) {
+        var shift = 0
+        var more = true
+        while (more) {
+          if (offset >= bytes.size || shift > 28) invalid()
+          val next = bytes(offset) & 0xff
+          offset += 1
+          value += (next & 0x7f).toLong << shift
+          if (value > Int.MaxValue) invalid()
+          more = (next & 0x80) != 0
+          shift += 7
+        }
+      }
+      value
+    }
+    def string(): Unit = {
+      val length = integer(7)
+      if (length > bytes.size - offset) invalid()
+      offset += length
+    }
+    while (offset < bytes.size) {
+      val first = bytes(offset) & 0xff
+      if ((first & 0x80) != 0) {
+        if (integer(7) == 0) invalid()
+        fieldsStarted = true
+      } else if ((first & 0xe0) == 0x20) {
+        if (fieldsStarted) invalid()
+        integer(5)
+        ()
+      } else {
+        val index = integer(if ((first & 0x40) != 0) 6 else 4)
+        if (index == 0) string()
+        string()
+        fieldsStarted = true
+      }
     }
   }
 

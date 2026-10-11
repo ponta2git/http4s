@@ -166,10 +166,10 @@ class H2StreamSuite extends Http4sSuite {
   ) {
     for {
       stream <- clientStream(defaultSettings)
+      _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Open))
       headers <- stream.hpack.encodeHeaders(
         NonEmptyList.of(
-          (":status", "200", false),
-          (":method", "GET", false),
+          (":status", "200", false)
         )
       )
       init = H2Frame.Headers(
@@ -471,6 +471,7 @@ class H2StreamSuite extends Http4sSuite {
     for {
       sq <- streamAndQueue(defaultSettings)
       (stream, queue) = sq
+      _ <- stream.state.get.flatMap(_.request.complete(Right(Request[fs2.Pure]())))
       _ <- stream.state.update(_.copy(readWindow = 2))
       _ <- stream.receiveData(
         H2Frame.Data(1, ByteVector.empty, Some(ByteVector.fill(2)(0)), endStream = false)
@@ -546,6 +547,7 @@ class H2StreamSuite extends Http4sSuite {
             contentLengthCheck = Some((declaredLength, 0L)),
           )
         )
+        _ <- stream.state.get.flatMap(_.request.complete(Right(Request[fs2.Pure]())))
         data = H2Frame.Data(1, ByteVector.fromValidHex("0001"), None, endStream = true)
         _ <- stream.receiveData(data)
         body <- stream.readBody.compile.toVector.attempt
@@ -616,7 +618,8 @@ class H2StreamSuite extends Http4sSuite {
             def encodeHeadersWith[A](headers: NonEmptyList[(String, String, Boolean)])(
                 send: ByteVector => IO[A]
             ): IO[A] = delegate.encodeHeadersWith(headers)(send)
-            def decodeHeaders(bytes: ByteVector): IO[NonEmptyList[(String, String)]] =
+            def updateEncoderTableSize(size: Int): IO[Unit] = delegate.updateEncoderTableSize(size)
+            def decodeHeaders(bytes: ByteVector): IO[List[(String, String)]] =
               entered.complete(()).void >> resume.get >> delegate.decodeHeaders(bytes)
             def decodeHeadersAndDiscard(bytes: ByteVector): IO[Unit] =
               delegate.decodeHeadersAndDiscard(bytes)
@@ -671,6 +674,7 @@ class H2StreamSuite extends Http4sSuite {
         closed <- Ref[IO].of(0)
         sq <- streamAndQueue(defaultSettings, onClosed = closed.update(_ + 1))
         (stream, queue) = sq
+        _ <- stream.state.get.flatMap(_.request.complete(Right(Request[fs2.Pure]())))
         buffer <- Channel.bounded[IO, Either[Throwable, ByteVector]](128)
         _ <- buffer.send(Right(ByteVector.empty)).replicateA_(128)
         _ <- stream.state.update(_.copy(readBuffer = buffer, readWindow = 1))
@@ -780,7 +784,8 @@ class H2StreamSuite extends Http4sSuite {
                   case _ => send(bytes)
                 }
               }
-            def decodeHeaders(bytes: ByteVector): IO[NonEmptyList[(String, String)]] =
+            def updateEncoderTableSize(size: Int): IO[Unit] = delegate.updateEncoderTableSize(size)
+            def decodeHeaders(bytes: ByteVector): IO[List[(String, String)]] =
               delegate.decodeHeaders(bytes)
             def decodeHeadersAndDiscard(bytes: ByteVector): IO[Unit] =
               delegate.decodeHeadersAndDiscard(bytes)
@@ -823,7 +828,7 @@ class H2StreamSuite extends Http4sSuite {
             Some(1),
           )
           assertEquals(blocks.size, 2)
-          assertEquals(decoded, List.fill(2)(headers.map(h => (h._1, h._2))))
+          assertEquals(decoded, List.fill(2)(headers.toList.map(h => (h._1, h._2))))
         }
       }
     }
@@ -892,4 +897,184 @@ class H2StreamSuite extends Http4sSuite {
       _ = assert(result.isCanceled)
     } yield ()
   }
+
+  private def receiveFields(
+      stream: H2Stream[IO],
+      fields: List[(String, String)],
+      end: Boolean,
+  ): IO[Unit] =
+    (if (fields.isEmpty) IO.pure(ByteVector.empty)
+     else
+       stream.hpack.encodeHeaders(NonEmptyList.fromListUnsafe(fields.map { case (n, v) =>
+         (n, v, false)
+       })))
+      .flatMap(bytes =>
+        stream.receiveHeaders(H2Frame.Headers(1, None, end, true, bytes, None), Nil)
+      )
+
+  test("informational responses precede the final response") {
+    for {
+      pair <- streamAndQueue(defaultSettings, H2Connection.ConnectionType.Client)
+      (stream, queue) = pair
+      _ <- receiveFields(stream, List(":status" -> "103"), false)
+      pending <- stream.state.get.flatMap(_.response.tryGet)
+      _ <- receiveFields(stream, List(":status" -> "200"), true)
+      response <- stream.getResponse
+      frames <- drainFrames(queue)
+    } yield {
+      assertEquals(pending, None)
+      assertEquals(response.status, Status.Ok)
+      assertEquals(frames, Vector.empty)
+    }
+  }
+
+  test("informational response with END_STREAM is a protocol error") {
+    for {
+      pair <- streamAndQueue(defaultSettings, H2Connection.ConnectionType.Client)
+      (stream, queue) = pair
+      _ <- receiveFields(stream, List(":status" -> "103"), true)
+      frames <- drainFrames(queue)
+    } yield assertEquals(frames, Vector(H2Error.ProtocolError.toRst(1)))
+  }
+
+  List(List(":status" -> "200"), List("x" -> "bad\r\nvalue")).foreach { fields =>
+    test(s"invalid response trailers are rejected: $fields") {
+      for {
+        pair <- streamAndQueue(defaultSettings, H2Connection.ConnectionType.Client)
+        (stream, queue) = pair
+        _ <- receiveFields(stream, List(":status" -> "200"), false)
+        _ <- receiveFields(stream, fields, true)
+        frames <- drainFrames(queue)
+      } yield assertEquals(frames, Vector(H2Error.ProtocolError.toRst(1)))
+    }
+  }
+
+  test("empty trailing HEADERS complete the body") {
+    for {
+      pair <- streamAndQueue(defaultSettings, H2Connection.ConnectionType.Client)
+      (stream, queue) = pair
+      _ <- receiveFields(stream, List(":status" -> "200"), false)
+      _ <- receiveFields(stream, Nil, true)
+      body <- stream.readBody.compile.toVector
+      frames <- drainFrames(queue)
+    } yield {
+      assertEquals(body, Vector.empty)
+      assertEquals(frames, Vector.empty)
+    }
+  }
+
+  List(false, true).foreach { trailers =>
+    test(s"content-length is checked when HEADERS ends the message, trailers=$trailers") {
+      for {
+        pair <- streamAndQueue(defaultSettings, H2Connection.ConnectionType.Client)
+        (stream, queue) = pair
+        _ <- receiveFields(stream, List(":status" -> "200", "content-length" -> "1"), !trailers)
+        _ <- if (trailers) receiveFields(stream, Nil, true) else IO.unit
+        frames <- drainFrames(queue)
+      } yield assertEquals(frames, Vector(H2Error.ProtocolError.toRst(1)))
+    }
+  }
+
+  test("DATA cannot precede final response headers") {
+    for {
+      pair <- streamAndQueue(defaultSettings, H2Connection.ConnectionType.Client)
+      (stream, queue) = pair
+      _ <- receiveFields(stream, List(":status" -> "100"), false)
+      _ <- stream.receiveData(H2Frame.Data(1, ByteVector(1), None, false))
+      frames <- drainFrames(queue)
+    } yield assertEquals(frames, Vector(H2Error.ProtocolError.toRst(1)))
+  }
+
+  test("HEAD response content-length describes the representation, not a body") {
+    for {
+      pair <- streamAndQueue(defaultSettings, H2Connection.ConnectionType.Client)
+      (stream, queue) = pair
+      _ <- stream.state.get.flatMap(
+        _.request.complete(Right(Request[fs2.Pure](method = org.http4s.Method.HEAD)))
+      )
+      _ <- receiveFields(stream, List(":status" -> "200", "content-length" -> "123"), true)
+      response <- stream.getResponse
+      frames <- drainFrames(queue)
+    } yield {
+      assertEquals(response.contentLength, Some(123L))
+      assertEquals(frames, Vector.empty)
+    }
+  }
+
+  test("large headers are split into adjacent frames within the peer limit") {
+    for {
+      pair <- streamAndQueue(defaultSettings)
+      (stream, queue) = pair
+      fields = NonEmptyList.one(("x-large", "~" * 40000, false))
+      _ <- stream.sendHeaders(fields, endStream = true)
+      frames <- drainFrames(queue)
+      bytes = frames.foldLeft(ByteVector.empty) {
+        case (acc, h: H2Frame.Headers) => acc ++ h.headerBlock
+        case (acc, c: H2Frame.Continuation) => acc ++ c.headerBlockFragment
+        case (acc, _) => acc
+      }
+      decoder <- Hpack.create[IO](100000)
+      decoded <- decoder.decodeHeaders(bytes)
+    } yield {
+      assert(frames.size > 1)
+      assert(frames.forall(_.toRaw.length <= 16384))
+      assert(frames.head.asInstanceOf[H2Frame.Headers].endStream)
+      assert(!frames.head.asInstanceOf[H2Frame.Headers].endHeaders)
+      assert(frames.last.asInstanceOf[H2Frame.Continuation].endHeaders)
+      assertEquals(decoded, fields.toList.map(h => (h._1, h._2)))
+    }
+  }
+
+  test("an empty trailer effect still sends END_STREAM") {
+    for {
+      pair <- streamAndQueue(defaultSettings)
+      (stream, queue) = pair
+      message = Response[IO]()
+        .withAttribute(org.http4s.Message.Keys.TrailerHeaders[IO], IO.pure(Headers.empty))
+      _ <- stream.sendMessageBody(message) >> stream.sendTrailerHeaders(message)
+      frames <- drainFrames(queue)
+    } yield assertEquals(frames, Vector(H2Frame.Data(1, ByteVector.empty, None, true)))
+  }
+
+  test("stream receive credit is restored only when the application consumes data") {
+    for {
+      pair <- streamAndQueue(defaultSettings)
+      (stream, queue) = pair
+      _ <- stream.state.get.flatMap(_.request.complete(Right(Request[fs2.Pure]())))
+      _ <- stream.receiveData(H2Frame.Data(1, ByteVector.fill(40000)(0), None, false))
+      before <- drainFrames(queue)
+      window <- stream.state.get.map(_.readWindow)
+      reader <- stream.readBody.compile.drain.start
+      update <- queue.take
+      _ <- reader.cancel
+    } yield {
+      assertEquals(before, Vector.empty)
+      assertEquals(window, 25535)
+      assertEquals(update.toVector, Vector(H2Frame.WindowUpdate(1, 40000)))
+    }
+  }
+
+  test("stream credit is reserved before a blocked DATA queue offer") {
+    TestControl.executeEmbed {
+      for {
+        outgoing <- Queue.bounded[IO, Chunk[H2Frame]](1)
+        _ <- outgoing.offer(Chunk.singleton(H2Frame.Ping.default))
+        pair <- streamAndQueue(defaultSettings, outgoingOverride = Some(outgoing))
+        (stream, _) = pair
+        _ <- stream.state.update(_.copy(writeWindow = Int.MaxValue))
+        sending <- stream.sendData(ByteVector(1), endStream = false).start
+        _ <- IO.sleep(1.seconds)
+        _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 1))
+        reserved <- stream.state.get
+        _ <- outgoing.take
+        _ <- sending.joinWithNever
+        frames <- drainFrames(outgoing)
+      } yield {
+        assertEquals(reserved.writeWindow, Int.MaxValue)
+        assertEquals(reserved.state, H2Stream.StreamState.Open)
+        assertEquals(frames, Vector(H2Frame.Data(1, ByteVector(1), None, false)))
+      }
+    }
+  }
+
 }

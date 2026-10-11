@@ -138,8 +138,8 @@ object HttpVersion {
   /** HTTP/3 is the third major version of HTTP.  It defines no minor
     * versions, so minor version `0` is implied.
     *
-    * @see [[https://quicwg.org/base-drafts/draft-ietf-quic-http.html
-    * Hypertext Transfer Protocol Version 3 (HTTP/3)]] (draft)
+    * @see [[https://www.rfc-editor.org/rfc/rfc9114.html
+    * HTTP/3]]
     */
   val `HTTP/3`: HttpVersion = new HttpVersion(3, 0)
 

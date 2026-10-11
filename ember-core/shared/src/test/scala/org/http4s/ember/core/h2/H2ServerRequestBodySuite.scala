@@ -155,15 +155,15 @@ class H2ServerRequestBodySuite extends Http4sSuite {
                 )
               )
               _ <- handlingRequest.get
-              first <-
+              _ <-
                 if (prefill)
                   for {
                     _ <- input.offer(frameBytes(lateBody ++ followup))
                     // Under virtual time all runnable work settles before the clock advances.
-                    // DATA #129 is blocked with no body consumer while the response is gated.
+                    // An unconsumed body must not prevent processing control frames.
                     _ <- IO.sleep(1.second)
                     before <- observed.get
-                    _ = assert(!before.contains(ping.copy(ack = true)), clue(before))
+                    _ = assert(before.contains(ping.copy(ack = true)), clue(before))
                     _ <- releaseResponse.complete(())
                     completed <- awaitResponseEnd(output, 1)
                   } yield completed
@@ -173,9 +173,15 @@ class H2ServerRequestBodySuite extends Http4sSuite {
                     completed <- awaitResponseEnd(output, 1)
                     _ <- input.offer(frameBytes(lateBody ++ followup))
                   } yield completed
-              rest <- awaitResponseEnd(output, 3)
+              // Streams can finish in either order; response 3 may already have been observed
+              // while awaiting response 1.
+              _ <- IO
+                .sleep(1.millis)
+                .untilM_(observed.get.map(_.exists(isResponseEnd(3))))
+                .timeout(2.seconds)
+              _ <- IO.sleep(1.second)
               calls <- requests.get
-              frames = first ++ rest
+              frames <- observed.get
               resets = frames.collect {
                 case reset: H2Frame.RstStream if reset.identifier == 1 =>
                   reset
@@ -284,7 +290,12 @@ class H2ServerRequestBodySuite extends Http4sSuite {
               _ <- awaitPing(output)
               _ <- releaseResponse.complete(())
               _ <- input.offer(frameBytes(List(H2Frame.Headers(3, None, true, true, next, None))))
-              _ <- awaitResponseEnd(output, 3)
+              // Streams can finish in either order; response 3 may already have been observed
+              // while awaiting response 1.
+              _ <- IO
+                .sleep(1.millis)
+                .untilM_(observed.get.map(_.exists(isResponseEnd(3))))
+                .timeout(2.seconds)
               calls <- requests.get
               releases <- finalized.get
               evaluated <- bodyEffects.get

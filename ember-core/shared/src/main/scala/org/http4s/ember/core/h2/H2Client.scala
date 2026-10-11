@@ -91,7 +91,23 @@ private[ember] class H2Client[F[_]](
       enableServerNameIndication: Boolean,
   ): F[H2Connection[F]] =
     connections.get.map(_.get(key).map(_._1)).flatMap {
-      case Some(connection) => Applicative[F].pure(connection)
+      case Some(connection) =>
+        connection.state.get.flatMap { s =>
+          if (s.closed)
+            connections
+              .modify { m =>
+                val owned = m.get(key).filter { case (current, _) => current eq connection }
+                (if (owned.isDefined) m - key else m, owned)
+              }
+              .flatMap(_.traverse_(_._2)) >> getOrCreate(
+              key,
+              useTLS,
+              priorKnowledge,
+              enableEndpointValidation,
+              enableServerNameIndication,
+            )
+          else Applicative[F].pure(connection)
+        }
       case None =>
         createConnection(
           key,
@@ -186,13 +202,16 @@ private[ember] class H2Client[F[_]](
         _ <- socket.write(Chunk.byteVector(Preface.clientBV))
         ref <- Concurrent[F].ref(Map[Int, H2Stream[F]]())
         stateRef <- H2Connection.initState[F](
-          defaultSettings,
+          defaultSettings.copy(maxConcurrentStreams =
+            H2Frame.Settings.SettingsMaxConcurrentStreams(-1)
+          ),
           defaultSettings.initialWindowSize,
           defaultSettings.initialWindowSize,
         )
         queue <- cats.effect.std.Queue.bounded[F, Chunk[H2Frame]](128)
+        control <- cats.effect.std.Queue.bounded[F, Chunk[H2Frame]](128)
         hpack <- Hpack.create[F](
-          localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize),
+          localSettings.maxHeaderListSize.fold(65536)(_.listSize),
           H2Connection.abort(stateRef, ref),
         )
         settingsAck <- Deferred[F, Either[Throwable, H2Frame.Settings.ConnectionSettings]]
@@ -217,6 +236,7 @@ private[ember] class H2Client[F[_]](
         acc,
         socket,
         logger,
+        Some(control),
       )
 
     def clearClosed(h2: H2Connection[F]): F[Unit] =
@@ -235,6 +255,20 @@ private[ember] class H2Client[F[_]](
           } // FOLD
           // _ <- Sync[F].delay(println(s"Push promise stream acquired for $i"))
           req <- stream.getRequest
+          authoritative = key.authorityOrAddress.toOption.exists(authority =>
+            req.uri.scheme.contains(key.scheme) && req.uri.authority.exists(a =>
+              a.host.value.equalsIgnoreCase(authority.host.value) &&
+                a.port.getOrElse(if (key.scheme == Scheme.https) 443 else 80) ==
+                authority.port.getOrElse(if (key.scheme == Scheme.https) 443 else 80)
+            )
+          )
+          _ <-
+            if (authoritative) F.unit
+            else
+              stream.rstStream(H2Error.ProtocolError) >>
+                F.raiseError[Unit](
+                  new ProtocolException("Push promise is not authoritative for this connection")
+                )
           resp = stream.getResponse.map(_.covary[F].withBodyStream(stream.readBody))
           // _ <- Sync[F].delay(println(s"Push promise request acquired for $i"))
           outE <- onPushPromise(req, resp).flatMap {
@@ -242,9 +276,9 @@ private[ember] class H2Client[F[_]](
             case Outcome.Errored(_) => stream.rstStream(H2Error.RefusedStream)
             case Outcome.Succeeded(f) => f
           }.attempt
-          _ <- h2.mapRef.update(_ - i)
           out <- outE.liftTo[F]
         } yield out)
+          .guarantee(h2.mapRef.update(_ - i))
           .onError { case e => logger.warn(e)(s"Error Handling Push Promise") }
           .attempt
           .void
@@ -257,18 +291,18 @@ private[ember] class H2Client[F[_]](
         .onError { case e => logger.info(e)(s"Server Connection Processing Halted") } // Idle etc.
     }
 
-    def processSettings(h2: H2Connection[F]): F[Unit] = {
+    def processSettings: F[Unit] = {
       val localSetts = H2Frame.Settings.ConnectionSettings.toSettings(localSettings)
-      h2.outgoing.offer(Chunk.singleton(localSetts))
+      socket.write(Chunk.byteVector(H2Frame.toByteVector(localSetts)))
     }
 
     for {
       h2 <- Resource.eval(createH2Connection)
+      _ <- Resource.eval(processSettings)
       _ <- h2.readLoop.background
       _ <- h2.writeLoop.compile.drain.background
       _ <- clearClosed(h2).background
       _ <- pullCreatedStreams(h2).background
-      _ <- Resource.eval(processSettings(h2))
     } yield h2
   }
 
@@ -303,10 +337,13 @@ private[ember] class H2Client[F[_]](
       stream <- Resource.make(
         connection.streamCreateAndHeaders.use(_ =>
           connection.initiateLocalStream.flatMap(stream =>
-            stream.sendHeaders(PseudoHeaders.requestToHeaders(req), endStream = false).as(stream)
+            stream
+              .sendHeaders(PseudoHeaders.requestToHeaders(req), endStream = false)
+              .as(stream)
+              .onError { case _ => connection.mapRef.update(_ - stream.id) }
           )
         )
-      )(stream => connection.mapRef.update(m => m - stream.id))
+      )(stream => stream.rstStream(H2Error.Cancel) >> connection.mapRef.update(m => m - stream.id))
       _ <- (stream.sendMessageBody(req) >> stream.sendTrailerHeaders(req)).background
       resp <- Resource.eval(stream.getResponse).map(_.covary[F].withBodyStream(stream.readBody))
     } yield resp
@@ -344,9 +381,16 @@ private[ember] object H2Client {
         .awakeDelay(1.seconds)
         .evalMap(_ => mapH2.get)
         .flatMap(m => Stream.emits(m.toList))
-        .evalMap { case (t, (connection, shutdown)) =>
+        .evalMap { case (t, (connection, _)) =>
           connection.state.get.flatMap { s =>
-            if (s.closed) mapH2.update(m => m - t) >> shutdown else Applicative[F].unit
+            if (s.closed)
+              mapH2
+                .modify { m =>
+                  val owned = m.get(t).filter { case (current, _) => current eq connection }
+                  (if (owned.isDefined) m - t else m, owned)
+                }
+                .flatMap(_.traverse_(_._2))
+            else Applicative[F].unit
           }.attempt
         }
         .compile

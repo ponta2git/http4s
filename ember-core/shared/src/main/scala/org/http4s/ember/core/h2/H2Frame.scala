@@ -138,20 +138,29 @@ private[ember] object H2Frame {
     }
   }
 
+  private val streamFrameTypes = Set(0, 1, 2, 3, 5, 9)
+  private val connectionFrameTypes = Set(4, 6, 7)
+
   def fromRaw(rawFrame: RawFrame): Either[H2Error, H2Frame] =
-    (rawFrame.`type`: @switch) match {
-      case Data.`type` => Data.fromRaw(rawFrame)
-      case Headers.`type` => Headers.fromRaw(rawFrame)
-      case Priority.`type` => Priority.fromRaw(rawFrame)
-      case RstStream.`type` => RstStream.fromRaw(rawFrame)
-      case Settings.`type` => Settings.fromRaw(rawFrame)
-      case PushPromise.`type` => PushPromise.fromRaw(rawFrame)
-      case Ping.`type` => Ping.fromRaw(rawFrame)
-      case GoAway.`type` => GoAway.fromRaw(rawFrame)
-      case WindowUpdate.`type` => WindowUpdate.fromRaw(rawFrame)
-      case Continuation.`type` => Continuation.fromRaw(rawFrame)
-      case _ => Unknown(rawFrame).asRight
-    }
+    if (rawFrame.length != rawFrame.payload.size) Left(H2Error.FrameSizeError)
+    else if (
+      (streamFrameTypes.contains(rawFrame.`type`.toInt) && rawFrame.identifier == 0) ||
+      (connectionFrameTypes.contains(rawFrame.`type`.toInt) && rawFrame.identifier != 0)
+    ) Left(H2Error.ProtocolError)
+    else
+      (rawFrame.`type`: @switch) match {
+        case Data.`type` => Data.fromRaw(rawFrame)
+        case Headers.`type` => Headers.fromRaw(rawFrame)
+        case Priority.`type` => Priority.fromRaw(rawFrame)
+        case RstStream.`type` => RstStream.fromRaw(rawFrame)
+        case Settings.`type` => Settings.fromRaw(rawFrame)
+        case PushPromise.`type` => PushPromise.fromRaw(rawFrame)
+        case Ping.`type` => Ping.fromRaw(rawFrame)
+        case GoAway.`type` => GoAway.fromRaw(rawFrame)
+        case WindowUpdate.`type` => WindowUpdate.fromRaw(rawFrame)
+        case Continuation.`type` => Continuation.fromRaw(rawFrame)
+        case _ => Unknown(rawFrame).asRight
+      }
 
   def toByteVector(frame: H2Frame): ByteVector =
     RawFrame.toByteVector(frame.toRaw)
@@ -193,18 +202,21 @@ private[ember] object H2Frame {
       if (rawFrame.`type` === `type`) {
         val endStream = (rawFrame.flags & (0x01 << 0)) != 0
         val padded = (rawFrame.flags & (0x01 << 3)) != 0
-        if (padded) {
-          val padLength = rawFrame.payload(0)
-          val baseSize = rawFrame.payload.size.toInt - 1
-          val dataSize = baseSize - padLength
-          val data = rawFrame.payload.drop(1).take(dataSize)
-          val pad = rawFrame.payload.drop(1).drop(dataSize)
-          if (pad.length == padLength && data.size == dataSize) {
-            Data(rawFrame.identifier, data, Some(pad), endStream).asRight
-          } else Either.left(H2Error.ProtocolError)
-        } else {
-          Data(rawFrame.identifier, rawFrame.payload, None, endStream).asRight
-        }
+        if (padded && rawFrame.payload.isEmpty) Left(H2Error.FrameSizeError)
+        else if (padded) {
+          val padLength = rawFrame.payload(0) & 0xff
+          val dataSize = rawFrame.payload.size - 1 - padLength
+          if (dataSize < 0) Left(H2Error.ProtocolError)
+          else
+            Right(
+              Data(
+                rawFrame.identifier,
+                rawFrame.payload.drop(1).take(dataSize),
+                Some(rawFrame.payload.takeRight(padLength)),
+                endStream,
+              )
+            )
+        } else Right(Data(rawFrame.identifier, rawFrame.payload, None, endStream))
       } else Either.left(H2Error.ProtocolError)
 
     def toRaw(data: Data): RawFrame = {
@@ -269,73 +281,35 @@ private[ember] object H2Frame {
           val padded = (rawFrame.flags & (0x01 << 3)) != 0
           val priority = (rawFrame.flags & (0x01 << 5)) != 0
 
-          (priority, padded) match {
-            case (false, false) =>
-              Headers(
-                rawFrame.identifier,
-                None,
-                endStream,
-                endHeaders,
-                rawFrame.payload,
-                None,
-              ).asRight
-            case (true, true) =>
-              // This hurts. And is SO inefficient
-              val bv = rawFrame.payload
-              val padLength = bv.get(0)
-              val pad = bv.takeRight(padLength)
-              val rest = bv.dropRight(padLength).drop(1)
-              val s0 = rest.get(0)
-              val s1 = rest.get(1)
-              val s2 = rest.get(2)
-              val s3 = rest.get(3)
-              val weight = rest.get(4)
-              val mod0 = s0 & ~(1 << 7)
-              val dependsOnStream = (mod0 << 24) + (s1 << 16) + (s2 << 8) + (s3 << 0)
-              val exclusive = (s0 & (0x01 << 7)) != 0
-              val payload = rest.drop(5)
-              Headers(
-                rawFrame.identifier,
-                Some(StreamDependency(exclusive, dependsOnStream, weight)),
-                endStream,
-                endHeaders,
-                payload,
-                Some(pad),
-              ).asRight
-            case (true, false) =>
-              val rest = rawFrame.payload
-              val s0 = rest.get(0)
-              val s1 = rest.get(1)
-              val s2 = rest.get(2)
-              val s3 = rest.get(3)
-              val weight = rest.get(4)
-              val mod0 = s0 & ~(1 << 7)
-              val dependsOnStream = (mod0 << 24) + (s1 << 16) + (s2 << 8) + (s3 << 0)
-              val exclusive = (s0 & (0x01 << 7)) != 0
-              val payload = rest.drop(5)
-
-              Headers(
-                rawFrame.identifier,
-                Some(StreamDependency(exclusive, dependsOnStream, weight)),
-                endStream,
-                endHeaders,
-                payload,
-                None,
-              ).asRight
-
-            case (false, true) =>
-              val bv = rawFrame.payload
-              val padLength = bv.get(0)
-              val pad = bv.takeRight(padLength)
-              val payload = bv.dropRight(padLength).drop(1)
-              Headers(
-                rawFrame.identifier,
-                None,
-                endStream,
-                endHeaders,
-                payload,
-                Some(pad),
-              ).asRight
+          val prefix = (if (padded) 1 else 0) + (if (priority) 5 else 0)
+          val bv = rawFrame.payload
+          if (bv.size < prefix) Left(H2Error.FrameSizeError)
+          else {
+            val padLength = if (padded) bv(0) & 0xff else 0
+            if (padLength > bv.size - prefix) Left(H2Error.ProtocolError)
+            else {
+              val rest = bv.drop(if (padded) 1 else 0)
+              val dependency =
+                if (priority)
+                  Some(
+                    StreamDependency(
+                      (rest(0) & 0x80) != 0,
+                      rest.take(4).toInt() & Int.MaxValue,
+                      rest(4),
+                    )
+                  )
+                else None
+              Right(
+                Headers(
+                  rawFrame.identifier,
+                  dependency,
+                  endStream,
+                  endHeaders,
+                  bv.drop(prefix).dropRight(padLength),
+                  if (padded) Some(bv.takeRight(padLength)) else None,
+                )
+              )
+            }
           }
         case _ => Either.left(H2Error.InternalError)
       }
@@ -405,9 +379,9 @@ private[ember] object H2Frame {
           val s1 = raw.payload(1)
           val s2 = raw.payload(2)
           val s3 = raw.payload(3)
-          val mod0 = s0 & ~(1 << 7)
+          val mod0 = s0 & 0x7f
           val exclusive = (s0 & (0x01 << 7)) != 0
-          val dependency = (mod0 << 24) + (s1 << 16) + (s2 << 8) + (s3 << 0)
+          val dependency = (mod0 << 24) | ((s1 & 0xff) << 16) | ((s2 & 0xff) << 8) | (s3 & 0xff)
           val weight = raw.payload(4)
 
           Priority(raw.identifier, exclusive, dependency, weight).asRight
@@ -516,10 +490,8 @@ private[ember] object H2Frame {
           if (connectionSettings.enablePush != default.enablePush)
             connectionSettings.enablePush :: Nil
           else Nil
-        val maxConcurrentStreams =
-          if (connectionSettings.maxConcurrentStreams != default.maxConcurrentStreams)
-            connectionSettings.maxConcurrentStreams :: Nil
-          else Nil
+        // Unlike our local policy, the protocol default is unlimited.
+        val maxConcurrentStreams = connectionSettings.maxConcurrentStreams :: Nil
         val initialWindowSize =
           if (connectionSettings.initialWindowSize != default.initialWindowSize)
             connectionSettings.initialWindowSize :: Nil
@@ -576,7 +548,7 @@ private[ember] object H2Frame {
         val settings = for {
           i <- 0 to (payload.size.toInt - 5) by 6
         } yield {
-          val s = (payload(i) << 8) + (payload(i + 1) << 0)
+          val s = ((payload(i) & 0xff) << 8) | (payload(i + 1) & 0xff)
           val v0 = (payload(i + 2) & 0xff) << 24
           val v1 = (payload(i + 3) & 0xff) << 16
           val v2 = (payload(i + 4) & 0xff) << 8
@@ -630,7 +602,7 @@ private[ember] object H2Frame {
     // The initial value is 2^16-1 (65,535) octets.
     final case class SettingsInitialWindowSize(windowSize: Integer) extends Setting(0x4, windowSize)
     object SettingsInitialWindowSize {
-      val MAX: SettingsInitialWindowSize = SettingsInitialWindowSize(Int.MaxValue - 1)
+      val MAX: SettingsInitialWindowSize = SettingsInitialWindowSize(Int.MaxValue)
       val MIN: SettingsInitialWindowSize = SettingsInitialWindowSize(65536 - 1)
       def fromInt(windowSize: Int): Either[H2Error, SettingsInitialWindowSize] =
         if (
@@ -717,33 +689,23 @@ private[ember] object H2Frame {
         val endHeaders = (raw.flags & (0x01 << 2)) != 0
         val padded = (raw.flags & (0x01 << 3)) != 0
 
-        if (padded) {
-
-          val padLength = raw.payload(0)
-          val s0 = raw.payload(1) & 0xff
-          val s1 = (raw.payload(2) & 0xff) << 16
-          val s2 = (raw.payload(3) & 0xff) << 8
-          val s3 = (raw.payload(4) & 0xff) << 0
-          val modS0 = (s0 & ~(1 << 7)) << 24
-          val s = modS0 | s1 | s2 | s3
-
-          PushPromise(
-            raw.identifier,
-            endHeaders,
-            s,
-            raw.payload.drop(5).dropRight(padLength),
-            raw.payload.takeRight(padLength).some,
-          ).asRight
-        } else {
-          val s0 = raw.payload(0) & 0xff
-          val s1 = (raw.payload(1) & 0xff) << 16
-          val s2 = (raw.payload(2) & 0xff) << 8
-          val s3 = (raw.payload(3) & 0xff) << 0
-          val modS0 = (s0 & ~(1 << 7)) << 24
-          val s = modS0 | s1 | s2 | s3
-
-          PushPromise(raw.identifier, endHeaders, s, raw.payload.drop(4), None).asRight
-
+        val prefix = if (padded) 5 else 4
+        if (raw.payload.size < prefix) Left(H2Error.FrameSizeError)
+        else {
+          val padLength = if (padded) raw.payload(0) & 0xff else 0
+          if (padLength > raw.payload.size - prefix) Left(H2Error.ProtocolError)
+          else {
+            val rest = raw.payload.drop(if (padded) 1 else 0)
+            Right(
+              PushPromise(
+                raw.identifier,
+                endHeaders,
+                rest.take(4).toInt() & Int.MaxValue,
+                rest.drop(4).dropRight(padLength),
+                if (padded) Some(raw.payload.takeRight(padLength)) else None,
+              )
+            )
+          }
         }
 
       } else H2Error.InternalError.asLeft
@@ -832,6 +794,7 @@ private[ember] object H2Frame {
 
     def fromRaw(raw: RawFrame): Either[H2Error, GoAway] =
       if (raw.`type` == `type`) {
+        if (raw.payload.size < 8) return Left(H2Error.FrameSizeError)
         val s0 = raw.payload(0) & 0xff
         val s1 = (raw.payload(1) & 0xff) << 16
         val s2 = (raw.payload(2) & 0xff) << 8

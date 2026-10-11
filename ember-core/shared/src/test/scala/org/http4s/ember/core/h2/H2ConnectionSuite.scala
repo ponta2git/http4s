@@ -81,6 +81,8 @@ class H2ConnectionSuite extends Http4sSuite {
       socketOverride: Option[Socket[IO]] = None,
       idleTimeout: Duration = Duration.Inf,
       outgoingOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
+      handshakeComplete: Boolean = true,
+      controlOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
   ): IO[H2Connection[IO]] =
     for {
       socket <- socketOverride.fold(readOnlySocket(input))(_.pure[IO])
@@ -99,6 +101,7 @@ class H2ConnectionSuite extends Http4sSuite {
       )
       lock <- Semaphore[IO](1)
       ack <- Deferred[IO, Either[Throwable, H2Frame.Settings.ConnectionSettings]]
+      _ <- ack.complete(Right(H2Frame.Settings.ConnectionSettings.default)).whenA(handshakeComplete)
       logger <- NoOpFactory[IO].fromClass(classOf[H2ConnectionSuite])
     } yield new H2Connection[IO](
       addr,
@@ -117,6 +120,7 @@ class H2ConnectionSuite extends Http4sSuite {
       ByteVector.empty,
       socket,
       logger,
+      controlOverride,
     )
 
   private def mkConnection(
@@ -490,7 +494,8 @@ class H2ConnectionSuite extends Http4sSuite {
     result.map { case (outgoing, promisedState) =>
       assert(!outgoing.exists(_.isInstanceOf[H2Frame.GoAway]), clue(outgoing))
       assert(outgoing.contains(H2Frame.Ping.ack), clue(outgoing))
-      assertEquals(promisedState, Some(H2Stream.StreamState.ReservedRemote))
+      // EOF closes the reserved stream and releases its response waiter.
+      assertEquals(promisedState, Some(H2Stream.StreamState.Closed))
     }
   }
 
@@ -526,7 +531,8 @@ class H2ConnectionSuite extends Http4sSuite {
 
     result.map { case (outgoing, promisedState) =>
       assert(!outgoing.exists(_.isInstanceOf[H2Frame.GoAway]), clue(outgoing))
-      assertEquals(promisedState, Some(H2Stream.StreamState.ReservedRemote))
+      // EOF closes the reserved stream and releases its response waiter.
+      assertEquals(promisedState, Some(H2Stream.StreamState.Closed))
       assert(outgoing.contains(H2Frame.Ping.ack), clue(outgoing))
     }
   }
@@ -938,8 +944,10 @@ class H2ConnectionSuite extends Http4sSuite {
         body <- stream.readBody.compile.drain.attempt.timeout(1.second)
         write <- streamState.writeBlock.get.timeout(1.second)
         connectionWrite <- h2.state.get.flatMap(_.writeBlock.get).timeout(1.second)
-        next <- h2.initiateLocalStream
-        subsequent <- next.sendHeaders(headers, endStream = false).attempt.timeout(1.second)
+        subsequent <- h2.initiateLocalStream
+          .flatMap(_.sendHeaders(headers, endStream = false))
+          .attempt
+          .timeout(1.second)
         frames <- drainOutgoing(h2)
       } yield {
         assert(closed)
@@ -950,6 +958,280 @@ class H2ConnectionSuite extends Http4sSuite {
         assert(subsequent.isLeft, clue(subsequent))
         assertEquals(frames, queued.toVector)
       }
+    }
+  }
+
+  List[H2Frame](H2Frame.Ping.default, H2Frame.Settings.Ack, H2Frame.WindowUpdate(0, 1)).foreach {
+    first =>
+      test(s"connection preface must start with non-ACK SETTINGS: $first") {
+        for {
+          h2 <- mkConnection(
+            H2Frame.Settings.ConnectionSettings.default,
+            frameBytes(first),
+            handshakeComplete = false,
+          )
+          _ <- h2.readLoop
+          frames <- drainOutgoing(h2)
+        } yield assertEquals(
+          frames.collectFirst { case g: H2Frame.GoAway => g.errorCode.toInt },
+          Some(H2Error.ProtocolError.value),
+        )
+      }
+  }
+
+  test("unsolicited server HEADERS cannot open an unreserved push stream") {
+    for {
+      hpack <- Hpack.create[IO](1024)
+      block <- hpack.encodeHeaders(NonEmptyList.one((":status", "200", false)))
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(H2Frame.Headers(2, None, true, true, block, None)),
+        H2Connection.ConnectionType.Client,
+      )
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield assertEquals(
+      frames.collectFirst { case g: H2Frame.GoAway => g.errorCode.toInt },
+      Some(H2Error.ProtocolError.value),
+    )
+  }
+
+  test("GOAWAY prevents subsequent stream creation") {
+    for {
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(H2Frame.GoAway(0, 0, 0, None)),
+        H2Connection.ConnectionType.Client,
+      )
+      _ <- h2.readLoop
+      next <- h2.initiateLocalStream.attempt
+    } yield assert(next.isLeft)
+  }
+
+  test("server SETTINGS_ENABLE_PUSH=1 is a protocol error") {
+    for {
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(H2Frame.Settings(0, false, List(H2Frame.Settings.SettingsEnablePush(true)))),
+        H2Connection.ConnectionType.Client,
+      )
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield assertEquals(
+      frames.collectFirst { case g: H2Frame.GoAway => g.errorCode.toInt },
+      Some(H2Error.ProtocolError.value),
+    )
+  }
+
+  test("a zero initial stream window does not prevent reading control frames") {
+    for {
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default
+          .copy(initialWindowSize = H2Frame.Settings.SettingsInitialWindowSize(0)),
+        frameBytes(H2Frame.Ping.default),
+      )
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield assert(frames.contains(H2Frame.Ping.ack))
+  }
+
+  test("SETTINGS applies repeated initial window values in wire order") {
+    for {
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes(
+          H2Frame.Settings(
+            0,
+            false,
+            List(
+              H2Frame.Settings.SettingsInitialWindowSize(Int.MaxValue),
+              H2Frame.Settings.SettingsInitialWindowSize(65535),
+            ),
+          )
+        ),
+      )
+      stream <- h2.initiateLocalStream
+      _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Open, writeWindow = 65536))
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield assertEquals(
+      frames.collectFirst { case g: H2Frame.GoAway => g.errorCode.toInt },
+      Some(H2Error.FlowControlError.value),
+    )
+  }
+
+  test("empty CONTINUATION flooding is bounded even without a header timeout") {
+    val initial = H2Frame.Headers(1, None, false, false, ByteVector.empty, None)
+    val continuation = H2Frame.Continuation(1, false, ByteVector.empty)
+    for {
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        frameBytes((initial :: List.fill(1024)(continuation)): _*),
+      )
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield assertEquals(
+      frames.collectFirst { case g: H2Frame.GoAway => g.errorCode.toInt },
+      Some(H2Error.EnhanceYourCalm.value),
+    )
+  }
+
+  test("PRIORITY with an invalid length is a stream error and PING still works") {
+    val malformed = H2Frame.RawFrame.toByteVector(H2Frame.RawFrame(0, 2, 0, 1, ByteVector.empty))
+    for {
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        malformed ++ frameBytes(H2Frame.Ping.default),
+      )
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+    } yield {
+      assert(frames.contains(H2Error.FrameSizeError.toRst(1)))
+      assert(frames.contains(H2Frame.Ping.ack))
+      assert(!frames.exists(_.isInstanceOf[H2Frame.GoAway]))
+    }
+  }
+
+  test("connection preface survives one-byte socket reads") {
+    for {
+      remaining <- Ref[IO].of(Preface.clientBV)
+      base <- testSocket(ByteVector.empty, _ => IO.unit)
+      fragmented = new Socket[IO] {
+        def read(maxBytes: Int): IO[Option[Chunk[Byte]]] = remaining.modify(b =>
+          (b.drop(1), if (b.isEmpty) None else Some(Chunk.byteVector(b.take(1))))
+        )
+        def endOfInput = base.endOfInput
+        def endOfOutput = base.endOfOutput
+        def isOpen = IO.pure(true)
+        def localAddress = IO.pure(addr)
+        def peerAddress = addr
+        def readN(numBytes: Int) = base.readN(numBytes)
+        def reads = base.reads
+        def remoteAddress = IO.pure(addr)
+        def write(bytes: Chunk[Byte]) = base.write(bytes)
+        def writes = base.writes
+        def address = addr
+        def getOption[A](key: SocketOption.Key[A]) = base.getOption(key)
+        def setOption[A](key: SocketOption.Key[A], value: A) = base.setOption(key, value)
+        def supportedOptions = base.supportedOptions
+      }
+      result <- H2Server.checkConnectionPreface(fragmented, 1.second)
+    } yield assertEquals(result, Right(()))
+  }
+
+  test("control frames remain writable while connection DATA is flow controlled") {
+    TestControl.executeEmbed {
+      for {
+        output <- Queue.unbounded[IO, Chunk[Byte]]
+        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        socket <- testSocket(ByteVector.empty, output.offer)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+          idleTimeout = 5.seconds,
+          controlOverride = Some(control),
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        _ <- h2.writeLoop.compile.drain.background.use { _ =>
+          h2.outgoing.offer(dataFrame(1)) >> IO.sleep(1.second) >>
+            control.offer(Chunk.singleton(H2Frame.Ping.ack)) >>
+            Stream
+              .repeatEval(output.take)
+              .filter(_.nonEmpty)
+              .take(1)
+              .compile
+              .lastOrError
+              .timeout(1.second)
+              .map(bytes =>
+                assertEquals(decodeFrames(bytes.toByteVector), Vector(H2Frame.Ping.ack))
+              )
+        }
+      } yield ()
+    }
+  }
+
+  test("large DATA uses available connection credit before waiting for an update") {
+    TestControl.executeEmbed {
+      for {
+        output <- Queue.unbounded[IO, Chunk[Byte]]
+        socket <- testSocket(ByteVector.empty, output.offer)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+          idleTimeout = 5.seconds,
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 5))
+        _ <- h2.writeLoop.compile.drain.background.use { _ =>
+          for {
+            _ <- h2.outgoing.offer(dataFrame(10))
+            first <- output.take.timeout(1.second)
+            _ = assertEquals(
+              decodeFrames(first.toByteVector).collect { case d: H2Frame.Data => d.data.size },
+              Vector(5L),
+            )
+            _ <- increaseWindowSize(h2, 5)
+            rest <- Stream
+              .repeatEval(output.take)
+              .filter(_.nonEmpty)
+              .take(1)
+              .compile
+              .lastOrError
+              .timeout(1.second)
+            _ = assertEquals(
+              decodeFrames(rest.toByteVector).collect { case d: H2Frame.Data => d.data.size },
+              Vector(5L),
+            )
+          } yield ()
+        }
+      } yield ()
+    }
+  }
+
+  test("socket EOF completes response and body waiters") {
+    for {
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default,
+        ByteVector.empty,
+        H2Connection.ConnectionType.Client,
+      )
+      stream <- h2.initiateLocalStream
+      _ <- h2.readLoop
+      response <- stream.getResponse.attempt.timeout(1.second)
+      body <- stream.readBody.compile.drain.attempt.timeout(1.second)
+    } yield {
+      assert(response.isLeft)
+      assert(body.isLeft)
+    }
+  }
+
+  test("remote concurrency limits refuse excess streams before application delivery") {
+    for {
+      encoder <- Hpack.create[IO](1024)
+      fields = NonEmptyList.of(
+        (":method", "GET", false),
+        (":scheme", "https", false),
+        (":path", "/", false),
+      )
+      first <- encoder.encodeHeaders(fields)
+      second <- encoder.encodeHeaders(fields)
+      h2 <- mkConnection(
+        H2Frame.Settings.ConnectionSettings.default
+          .copy(maxConcurrentStreams = H2Frame.Settings.SettingsMaxConcurrentStreams(1)),
+        frameBytes(
+          H2Frame.Headers(1, None, false, true, first, None),
+          H2Frame.Headers(3, None, true, true, second, None),
+        ),
+      )
+      _ <- h2.readLoop
+      frames <- drainOutgoing(h2)
+      created <- h2.createdStreams.tryTake
+      extra <- h2.createdStreams.tryTake
+    } yield {
+      assert(frames.contains(H2Error.RefusedStream.toRst(3)))
+      assertEquals(created, Some(1))
+      assertEquals(extra, None)
     }
   }
 

@@ -237,4 +237,78 @@ class H2FrameSpec extends CatsEffectSuite {
     )
   }
 
+  test("all short known frame payloads fail safely or decode without exceptions") {
+    for {
+      kind <- 0 to 9
+      flags <- 0 to 255
+      size <- 0 to 12
+    } {
+      val id = if (Set(4, 6, 7).contains(kind)) 0 else 1
+      H2Frame.fromRaw(
+        H2Frame.RawFrame(size, kind.toByte, flags.toByte, id, ByteVector.fill(size.toLong)(0))
+      )
+    }
+  }
+
+  test("stream and connection frames reject the wrong stream identifier") {
+    val streamFrames: List[H2Frame] = List(
+      H2Frame.Data(0, ByteVector.empty, None, false),
+      H2Frame.Headers(0, None, false, true, ByteVector.empty, None),
+      H2Frame.Priority(0, false, 1, 1),
+      H2Frame.RstStream(0, 0),
+      H2Frame.PushPromise(0, true, 2, ByteVector.empty, None),
+      H2Frame.Continuation(0, true, ByteVector.empty),
+      H2Frame.Ping.default.copy(identifier = 1),
+      H2Frame.Settings.Ack.copy(identifier = 1),
+      H2Frame.GoAway(1, 0, 0, None),
+    )
+    streamFrames.foreach(f => assertEquals(H2Frame.fromRaw(f.toRaw), Left(H2Error.ProtocolError)))
+  }
+
+  test("padding lengths are unsigned octets for DATA, HEADERS and PUSH_PROMISE") {
+    List(0, 127, 128, 255).foreach { size =>
+      val pad = Some(ByteVector.fill(size.toLong)(0))
+      val frames: List[H2Frame] = List(
+        H2Frame.Data(1, ByteVector(42), pad, false),
+        H2Frame.Headers(1, None, false, true, ByteVector(42), pad),
+        H2Frame.Headers(
+          1,
+          Some(H2Frame.Headers.StreamDependency(true, 0x7f80ff80, 1)),
+          false,
+          true,
+          ByteVector(42),
+          pad,
+        ),
+        H2Frame.PushPromise(1, true, 2, ByteVector(42), pad),
+      )
+      frames.foreach(f => assertEquals(H2Frame.fromRaw(f.toRaw), Right(f)))
+    }
+  }
+
+  test("padding cannot overlap mandatory fields or exceed the payload") {
+    List(
+      (0, 8, ByteVector(2, 0)),
+      (1, 8, ByteVector(2, 0)),
+      (1, 40, ByteVector(1, 0, 0, 0, 0, 1)),
+      (5, 8, ByteVector(1, 0, 0, 0, 2)),
+    ).foreach { case (kind, flags, bytes) =>
+      assertEquals(
+        H2Frame.fromRaw(H2Frame.RawFrame(bytes.size.toInt, kind.toByte, flags.toByte, 1, bytes)),
+        Left(H2Error.ProtocolError),
+      )
+    }
+  }
+
+  test("priority dependencies retain unsigned low octets") {
+    val frame = H2Frame.Priority(1, true, 0x7f80ff80, 1)
+    assertEquals(H2Frame.fromRaw(frame.toRaw), Right(frame))
+  }
+
+  test("maximum initial window is 2^31 - 1") {
+    assertEquals(
+      H2Frame.Settings.SettingsInitialWindowSize.fromInt(Int.MaxValue),
+      Right(H2Frame.Settings.SettingsInitialWindowSize(Int.MaxValue)),
+    )
+  }
+
 }

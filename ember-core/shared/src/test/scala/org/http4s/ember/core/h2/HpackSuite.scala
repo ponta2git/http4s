@@ -53,7 +53,7 @@ class HpackSuite extends Http4sSuite {
         hpack <- Hpack.create[IO](65635)
         bv <- hpack.encodeHeaders(headers.map { case Header.Raw(n, v) => (n.toString, v, false) })
         decoded <- hpack.decodeHeaders(bv)
-      } yield assertEquals(decoded, headers.map { case Header.Raw(n, v) => (n.toString, v) })
+      } yield assertEquals(decoded, headers.toList.map { case Header.Raw(n, v) => (n.toString, v) })
     }
   }
 
@@ -75,7 +75,7 @@ class HpackSuite extends Http4sSuite {
       _ <- hpack.decodeHeadersAndDiscard(ByteVector.empty)
       _ <- hpack.decodeHeadersAndDiscard(first)
       decoded <- hpack.decodeHeaders(second)
-    } yield assertEquals(decoded, NonEmptyList.one(("x-dynamic", "value")))
+    } yield assertEquals(decoded, List(("x-dynamic", "value")))
   }
 
   test("encoding and sending header blocks share one connection order") {
@@ -108,7 +108,7 @@ class HpackSuite extends Http4sSuite {
           }
         blocks <- outgoing.take.replicateA(2)
         decoded <- blocks.traverse(decoder.decodeHeaders)
-      } yield assertEquals(decoded, List.fill(2)(headers.map(h => (h._1, h._2))))
+      } yield assertEquals(decoded, List.fill(2)(headers.toList.map(h => (h._1, h._2))))
     }
   }
 
@@ -167,7 +167,7 @@ class HpackSuite extends Http4sSuite {
         decoded <- blocks.traverse(decoder.decodeHeaders)
         count <- failures.get
       } yield {
-        assertEquals(decoded, List.fill(2)(headers.map(h => (h._1, h._2))))
+        assertEquals(decoded, List.fill(2)(headers.toList.map(h => (h._1, h._2))))
         assertEquals(count, 0)
       }
     }
@@ -186,6 +186,37 @@ class HpackSuite extends Http4sSuite {
       assertEquals(result, Left(failure))
       assert(subsequent.isLeft, clue(subsequent))
       assertEquals(count, 1)
+    }
+  }
+
+  test("empty field sections decode as empty trailers") {
+    Hpack.create[IO](1024).flatMap(_.decodeHeaders(ByteVector.empty)).map(h => assertEquals(h, Nil))
+  }
+
+  List("ff", "40", "400161", "40016101", "82ff", "8220", "3f", "000361").foreach { hex =>
+    test(s"incomplete or misplaced HPACK representation $hex is rejected") {
+      Hpack
+        .create[IO](1024)
+        .flatMap(_.decodeHeaders(ByteVector.fromValidHex(hex)))
+        .attempt
+        .map(result => assert(result.isLeft))
+    }
+  }
+
+  test("table size reductions and increases are emitted before the next field block") {
+    for {
+      encoder <- Hpack.create[IO](1024)
+      decoder <- Hpack.create[IO](1024)
+      fields = NonEmptyList.one(("x-dynamic", "value", false))
+      first <- encoder.encodeHeaders(fields)
+      _ <- decoder.decodeHeaders(first)
+      _ <- encoder.updateEncoderTableSize(0)
+      _ <- encoder.updateEncoderTableSize(4096)
+      next <- encoder.encodeHeaders(fields)
+      decoded <- decoder.decodeHeaders(next)
+    } yield {
+      assertEquals(next(0), 0x20.toByte)
+      assertEquals(decoded, List("x-dynamic" -> "value"))
     }
   }
 
