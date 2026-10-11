@@ -166,8 +166,8 @@ private[ember] object H2Server {
         defaultSettings.initialWindowSize,
         defaultSettings.initialWindowSize,
       )
-      queue <- cats.effect.std.Queue.bounded[F, Chunk[H2Frame]](128)
-      control <- cats.effect.std.Queue.bounded[F, Chunk[H2Frame]](128)
+      queue <- cats.effect.std.Queue.bounded[F, H2Write[F]](128)
+      control <- cats.effect.std.Queue.bounded[F, H2Write[F]](128)
       hpack <- Hpack.create[F](
         localSettings.maxHeaderListSize.fold(65536)(_.listSize),
         H2Connection.abort(stateRef, ref),

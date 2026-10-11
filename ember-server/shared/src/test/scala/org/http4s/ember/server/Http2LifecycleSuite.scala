@@ -32,6 +32,88 @@ import java.nio.charset.StandardCharsets.UTF_8
 import scala.concurrent.duration._
 
 class Http2LifecycleSuite extends Http4sSuite {
+  List(
+    "concurrency limit" -> List(3 -> 256),
+    "header table shrink" -> List(1 -> 0),
+    "all settings repeated in wire order" -> List(
+      1 -> 0,
+      1 -> 1024,
+      2 -> 0,
+      2 -> 1,
+      3 -> 64,
+      3 -> 256,
+      4 -> 131072,
+      4 -> 262144,
+      5 -> 16384,
+      5 -> 32768,
+      6 -> 65536,
+      6 -> 131072,
+    ),
+  ).foreach { case (name, settings) =>
+    test(s"SETTINGS ACK bypasses DATA stalled on connection flow control: $name") {
+      val app =
+        Kleisli[IO, Request[IO], Response[IO]](_ => IO.pure(Response[IO]().withEntity("x" * 98304)))
+      withServer(app, 1.second) { (peer, _, _) =>
+        for {
+          _ <- peer.streamWindow(131072)
+          _ <- peer.get(1, "/large")
+          _ <- peer.exhaustConnectionWindow.timeout(3.seconds)
+          _ <- peer.changeSettings(settings)
+          // PING confirms the reader processed SETTINGS. Its reader retains an ACK
+          // that arrives first, so the assertion cannot mistake a consumed ACK for a stall.
+          _ <- peer.ping
+          _ <- peer.awaitSettingsAck.timeout(2.seconds)
+          // Credit is deliberately restored only after the SETTINGS ACK is received.
+          _ <- peer.connectionWindow(65535)
+          remaining <- peer.body(1).timeout(3.seconds)
+        } yield assertEquals(remaining, "x" * (98304 - 65535))
+      }
+    }
+  }
+
+  test("decreased stream window applies to DATA already queued behind connection flow control") {
+    val app =
+      Kleisli[IO, Request[IO], Response[IO]](_ => IO.pure(Response[IO]().withEntity("x" * 98304)))
+    withServer(app, 1.second) { (peer, _, _) =>
+      for {
+        _ <- peer.streamWindow(131072)
+        _ <- peer.get(1, "/large")
+        _ <- peer.exhaustConnectionWindow.timeout(3.seconds)
+        _ <- peer.streamWindow(0)
+        _ <- peer.connectionWindow(65535)
+        _ <- peer.assertNoData
+        // Reducing the initial window to zero after sending 65535 bytes leaves
+        // negative stream credit. Repaying that deficit permits no additional bytes.
+        _ <- peer.streamWindowUpdate(1, 65535)
+        _ <- peer.assertNoData
+        _ <- peer.streamWindowUpdate(1, 1)
+        first <- peer.data(1).timeout(2.seconds)
+        _ = assertEquals(first.payload, ByteVector('x'.toByte))
+        _ = assertEquals(first.flags & 1, 0)
+        _ <- peer.assertNoData
+        _ <- peer.streamWindowUpdate(1, 65535)
+        remaining <- peer.body(1).timeout(3.seconds)
+      } yield assertEquals(remaining, "x" * (98304 - 65535 - 1))
+    }
+  }
+
+  test("decreased maximum frame size applies to DATA queued before SETTINGS ACK") {
+    val app =
+      Kleisli[IO, Request[IO], Response[IO]](_ => IO.pure(Response[IO]().withEntity("x" * 98304)))
+    withServer(app, 1.second) { (peer, _, _) =>
+      for {
+        _ <- peer.changeSettings(List(4 -> 131072, 5 -> 65536))
+        _ <- peer.awaitSettingsAck.timeout(2.seconds)
+        _ <- peer.get(1, "/large")
+        _ <- peer.exhaustConnectionWindow.timeout(3.seconds)
+        _ <- peer.changeSettings(List(5 -> 16384))
+        _ <- peer.awaitSettingsAck.timeout(2.seconds)
+        _ <- peer.connectionWindow(65535)
+        remaining <- peer.body(1, maxFrameSize = 16384).timeout(3.seconds)
+      } yield assertEquals(remaining, "x" * (98304 - 65535))
+    }
+  }
+
   test("reset discards flow-blocked DATA so a later response can use connection credit") {
     val app = Kleisli[IO, Request[IO], Response[IO]] { request =>
       IO.pure(
@@ -197,10 +279,12 @@ class Http2LifecycleSuite extends Http4sSuite {
 
   private final class Peer(socket: Socket[IO]) {
     private val pingPayload = ByteVector.fromValidHex("0102030405060708")
+    // All reads are sequential; retain acknowledgments consumed while awaiting another frame.
+    private var settingsAcks = 0
 
     def initialize: IO[Unit] =
       socket.write(Chunk.array("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(UTF_8))) >>
-        write(Frame(4, 0, 0, ByteVector.empty))
+        write(Frame(4, 0, 0, ByteVector.empty)) >> awaitSettingsAck.timeout(3.seconds)
 
     def get(streamId: Int, path: String): IO[Unit] = {
       val authority = "localhost".getBytes(UTF_8)
@@ -216,14 +300,58 @@ class Http2LifecycleSuite extends Http4sSuite {
         write(Frame(6, 0, 0, pingPayload)) >> awaitPingAck
 
     def streamWindow(size: Int): IO[Unit] =
-      write(Frame(4, 0, 0, ByteVector(0.toByte, 4.toByte) ++ ByteVector.fromInt(size)))
+      changeSettings(List(4 -> size)) >> awaitSettingsAck.timeout(3.seconds)
+
+    def changeSettings(settings: List[(Int, Int)]): IO[Unit] =
+      write(
+        Frame(
+          4,
+          0,
+          0,
+          settings.foldLeft(ByteVector.empty) { case (bytes, (id, value)) =>
+            bytes ++ ByteVector.fromShort(id.toShort) ++ ByteVector.fromInt(value)
+          },
+        )
+      )
+
+    def ping: IO[Unit] = write(Frame(6, 0, 0, pingPayload)) >> awaitPingAck
+
+    def awaitSettingsAck: IO[Unit] = IO.defer {
+      if (settingsAcks > 0) IO(settingsAcks -= 1)
+      else
+        read.flatMap { frame =>
+          if (frame.kind == 4 && (frame.flags & 1) != 0) IO.unit
+          else acknowledge(frame) >> awaitSettingsAck
+        }
+    }
 
     def connectionWindow(size: Int): IO[Unit] =
       write(Frame(8, 0, 0, ByteVector.fromInt(size)))
 
+    def streamWindowUpdate(streamId: Int, size: Int): IO[Unit] =
+      write(Frame(8, 0, streamId, ByteVector.fromInt(size)))
+
+    def assertNoData: IO[Unit] = {
+      def rejectData: IO[Unit] = read.flatMap { frame =>
+        if (frame.kind == 0 && frame.payload.nonEmpty)
+          IO.raiseError(new AssertionError(s"DATA exceeded the stream window: $frame"))
+        else acknowledge(frame) >> rejectData
+      }
+      IO.race(IO.sleep(150.millis), rejectData).void
+    }
+
+    def data(streamId: Int): IO[Frame] = read.flatMap { frame =>
+      if (frame.streamId == streamId && frame.kind == 3)
+        IO.raiseError(new AssertionError(s"accepted stream $streamId was reset"))
+      else if (frame.streamId == streamId && frame.kind == 0) IO.pure(frame)
+      else acknowledge(frame) >> data(streamId)
+    }
+
     def exhaustConnectionWindow: IO[Unit] = {
       def consume(remaining: Long): IO[Unit] =
         if (remaining == 0) IO.unit
+        else if (remaining < 0)
+          IO.raiseError(new AssertionError("server exceeded the connection flow-control window"))
         else
           read.flatMap { frame =>
             if (frame.kind == 0) consume(remaining - frame.payload.size)
@@ -237,8 +365,9 @@ class Http2LifecycleSuite extends Http4sSuite {
       else acknowledge(frame) >> goAway
     }
 
-    def body(streamId: Int): IO[String] = {
+    def body(streamId: Int, maxFrameSize: Int = Int.MaxValue): IO[String] = {
       def collect(bytes: ByteVector): IO[String] = read.flatMap { frame =>
+        assert(frame.payload.size <= maxFrameSize, s"frame exceeds SETTINGS_MAX_FRAME_SIZE: $frame")
         if (frame.streamId == streamId && frame.kind == 3)
           IO.raiseError(new AssertionError(s"accepted stream $streamId was reset"))
         else if (frame.streamId == streamId && (frame.kind == 0 || frame.kind == 1)) {
@@ -258,7 +387,9 @@ class Http2LifecycleSuite extends Http4sSuite {
       .timeout(3.seconds)
 
     private def acknowledge(frame: Frame): IO[Unit] =
-      if (frame.kind == 4 && (frame.flags & 1) == 0)
+      if (frame.kind == 4 && (frame.flags & 1) != 0)
+        IO(settingsAcks += 1)
+      else if (frame.kind == 4 && (frame.flags & 1) == 0)
         write(Frame(4, 1, 0, ByteVector.empty))
       else if (frame.kind == 6 && (frame.flags & 1) == 0)
         write(Frame(6, 1, 0, frame.payload))

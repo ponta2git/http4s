@@ -90,7 +90,7 @@ class H2FrameSizeSuite extends Http4sSuite {
         H2Frame.Settings.ConnectionSettings.default.initialWindowSize,
         localSettings.initialWindowSize,
       )
-      outgoing <- Queue.unbounded[IO, Chunk[H2Frame]]
+      outgoing <- Queue.unbounded[IO, H2Write[IO]]
       created <- Queue.unbounded[IO, Int]
       closed <- Queue.unbounded[IO, Int]
       hpack <- Hpack.create[IO](localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize))
@@ -120,7 +120,7 @@ class H2FrameSizeSuite extends Http4sSuite {
     )
 
   private def drainOutgoing(h2: H2Connection[IO]): IO[Vector[H2Frame]] =
-    h2.outgoing.tryTake.flatMap {
+    h2.outgoing.tryTake.flatMap(_.traverse(_.frames)).flatMap {
       case Some(c) => drainOutgoing(h2).map(c.toVector ++ _)
       case None => IO.pure(Vector.empty)
     }

@@ -47,10 +47,12 @@ class H2StreamSuite extends Http4sSuite {
       onClosed: IO[Unit] = IO.unit,
       hpackOverride: Option[Hpack[IO]] = None,
       id: Int = 1,
-      outgoingOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
-      controlOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
+      outgoingOverride: Option[Queue[IO, H2Write[IO]]] = None,
+      controlOverride: Option[Queue[IO, H2Write[IO]]] = None,
       discardDataOverride: Option[Deferred[IO, Unit]] = None,
-  ): IO[(H2Stream[IO], Queue[IO, Chunk[H2Frame]])] =
+      remoteSettingsOverride: Option[IO[H2Frame.Settings.ConnectionSettings]] = None,
+      onGoAway: H2Error => IO[Unit] = _ => IO.unit,
+  ): IO[(H2Stream[IO], Queue[IO, H2Write[IO]])] =
     for {
       writeBlock <- Deferred[IO, Either[Throwable, Unit]]
       req <- Deferred[IO, Either[Throwable, Request[fs2.Pure]]]
@@ -75,18 +77,18 @@ class H2StreamSuite extends Http4sSuite {
       )
       hpack <- hpackOverride.fold(Hpack.create[IO](1024))(IO.pure)
       logger <- log4cats.noop.NoOpFactory[IO].fromClass(classOf[H2StreamSuite])
-      outgoing <- outgoingOverride.fold(Queue.unbounded[IO, Chunk[H2Frame]])(IO.pure)
+      outgoing <- outgoingOverride.fold(Queue.unbounded[IO, H2Write[IO]])(IO.pure)
       stream = new H2Stream[IO](
         id,
         60.seconds,
         defaultSettings,
         connectionType,
-        IO.pure(config),
+        remoteSettingsOverride.getOrElse(IO.pure(config)),
         state,
         hpack,
         outgoing,
         onClosed,
-        _ => IO.unit,
+        onGoAway,
         logger,
         controlOverride,
         Some(canceled),
@@ -96,10 +98,10 @@ class H2StreamSuite extends Http4sSuite {
 
   test("RST_STREAM bypasses a full DATA queue and notifies cancellation") {
     for {
-      outgoing <- Queue.bounded[IO, Chunk[H2Frame]](1)
-      control <- Queue.bounded[IO, Chunk[H2Frame]](1)
+      outgoing <- Queue.bounded[IO, H2Write[IO]](1)
+      control <- Queue.bounded[IO, H2Write[IO]](1)
       blocked = Chunk.singleton[H2Frame](H2Frame.Data(1, ByteVector(1), None, false))
-      _ <- outgoing.offer(blocked)
+      _ <- outgoing.offer(H2Write.now(blocked))
       pair <- streamAndQueue(
         defaultSettings,
         outgoingOverride = Some(outgoing),
@@ -108,8 +110,8 @@ class H2StreamSuite extends Http4sSuite {
       (stream, _) = pair
       _ <- stream.rstStream(H2Error.Cancel).timeout(2.seconds)
       _ <- stream.awaitCancellation.timeout(2.seconds)
-      reset <- control.take
-      queued <- outgoing.take
+      reset <- control.take.flatMap(_.frames)
+      queued <- outgoing.take.flatMap(_.frames)
       _ = assertEquals(reset, Chunk.singleton[H2Frame](H2Error.Cancel.toRst(1)))
       _ = assertEquals(queued, blocked)
     } yield ()
@@ -150,6 +152,77 @@ class H2StreamSuite extends Http4sSuite {
     } yield ()
   }
 
+  test("WINDOW_UPDATE counts queued reservations toward the maximum stream window") {
+    for {
+      pair <- streamAndQueue(defaultSettings)
+      (stream, outgoing) = pair
+      _ <- stream.state.update(_.copy(writeWindow = Int.MaxValue - 5, pendingWriteBytes = 5L))
+      _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 1))
+      frames <- drainFrames(outgoing)
+      _ = assertEquals(frames, Vector[H2Frame](H2Error.FlowControlError.toRst(1)))
+    } yield ()
+  }
+
+  test("SETTINGS counts queued reservations toward the maximum stream window") {
+    for {
+      error <- Deferred[IO, H2Error]
+      pair <- streamAndQueue(defaultSettings, onGoAway = e => error.complete(e).void)
+      (stream, _) = pair
+      _ <- stream.state.update(_.copy(writeWindow = Int.MaxValue - 5, pendingWriteBytes = 5L))
+      _ <- stream.modifyWriteWindow(1)
+      actual <- error.tryGet
+      _ = assertEquals(actual, Some(H2Error.FlowControlError))
+    } yield ()
+  }
+
+  List(false, true).foreach { cancelQueued =>
+    test(s"disabling push suppresses its queued promise and reset (canceled=$cancelQueued)") {
+      val headers = NonEmptyList.of(
+        (":method", "GET", false),
+        (":scheme", "http", false),
+        (":authority", "localhost", false),
+        (":path", "/push", false),
+      )
+      for {
+        remote <- Ref[IO].of(defaultSettings)
+        encoder <- Hpack.create[IO](1024)
+        fresh <- Hpack.create[IO](1024)
+        pair <- streamAndQueue(
+          defaultSettings,
+          id = 2,
+          hpackOverride = Some(encoder),
+          remoteSettingsOverride = Some(remote.get),
+        )
+        (stream, outgoing) = pair
+        _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Idle))
+        sending <- stream
+          .sendPushPromise(1, headers)
+          .onCancel(stream.rstStream(H2Error.Cancel))
+          .attempt
+          .start
+        queued <- outgoing.take
+        _ <- sending.cancel.whenA(cancelQueued)
+        _ <- remote.update(_.copy(enablePush = H2Frame.Settings.SettingsEnablePush(false)))
+        promise <- queued.frames
+        result <-
+          if (cancelQueued) IO.pure(Option.empty[Either[Throwable, Unit]])
+          else sending.joinWithNever.map(Some(_))
+        remaining <- drainFrames(outgoing)
+        state <- stream.state.get
+        encoded <- encoder.encodeHeaders(headers)
+        expected <- fresh.encodeHeaders(headers)
+        _ = assertEquals(promise, Chunk.empty[H2Frame])
+        _ = assertEquals(remaining, Vector.empty[H2Frame])
+        _ = assertEquals(state.state, H2Stream.StreamState.Closed)
+        _ = assert(state.pushSuppressed)
+        _ = assertEquals(encoded, expected)
+        _ = assert(
+          result.forall(_.left.exists(_.isInstanceOf[java.util.concurrent.CancellationException]))
+        )
+      } yield ()
+    }
+  }
+
   def clientStream(
       config: H2Frame.Settings.ConnectionSettings
   ): IO[H2Stream[IO]] =
@@ -176,7 +249,7 @@ class H2StreamSuite extends Http4sSuite {
       )
       hpack <- Hpack.create[IO](1024)
       logger <- log4cats.noop.NoOpFactory[IO].fromClass(classOf[H2StreamSuite])
-      enqueue <- Queue.unbounded[IO, Chunk[H2Frame]]
+      enqueue <- Queue.unbounded[IO, H2Write[IO]]
       stream = new H2Stream[IO](
         1,
         60.seconds,
@@ -194,7 +267,7 @@ class H2StreamSuite extends Http4sSuite {
 
   private def testMessageSize(
       stream: H2Stream[IO],
-      outgoing: Queue[IO, Chunk[H2Frame]],
+      outgoing: Queue[IO, H2Write[IO]],
       frameSize: Int,
       messageSize: Int,
       numFrames: Int,
@@ -204,7 +277,7 @@ class H2StreamSuite extends Http4sSuite {
 
     for {
       _ <- stream.sendMessageBody(sample)
-      chunks <- outgoing.take.replicateA(numFrames).map(_.flatMap(_.toList))
+      chunks <- outgoing.take.flatMap(_.frames).replicateA(numFrames).map(_.flatMap(_.toList))
       data = chunks.collect { case H2Frame.Data(_, data, _, _) => data }
       _ <- assertIO(IO(data.size), numFrames)
       _ <- assertIO(IO(data.map(_.size).sum), messageSize.toLong)
@@ -401,13 +474,13 @@ class H2StreamSuite extends Http4sSuite {
       gate <- Deferred[IO, Unit]
       resp = Response[IO](Status.Ok, HttpVersion.`HTTP/2`).withBodyStream(bodyStream(gate))
       fiber <- stream.sendMessageBody(resp).start
-      firstChunk <- queue.take
+      firstChunk <- queue.take.flatMap(_.frames)
       _ <- IO(assertFrame(firstChunk, "hello", endStream = false))
       _ <- assertIO(stream.state.get.map(_.state), H2Stream.StreamState.Open)
       _ <- gate.complete(())
-      secondChunk <- queue.take
+      secondChunk <- queue.take.flatMap(_.frames)
       _ <- IO(assertFrame(secondChunk, "world", endStream = false))
-      lastChunk <- queue.take
+      lastChunk <- queue.take.flatMap(_.frames)
       _ <- IO(assertFrame(lastChunk, "", endStream = true))
       _ <- fiber.joinWithNever
       _ <- assertIO(stream.state.get.map(_.state), H2Stream.StreamState.HalfClosedLocal)
@@ -437,7 +510,7 @@ class H2StreamSuite extends Http4sSuite {
       (stream, queue) = sq
       _ <- stream.state.update(_.copy(writeWindow = 0))
       _ <- stream.sendData(ByteVector.empty, endStream = true)
-      outgoing <- queue.take
+      outgoing <- queue.take.flatMap(_.frames)
       updated <- stream.state.get
       data = outgoing.collectFirst { case frame: H2Frame.Data => frame }
     } yield {
@@ -478,7 +551,7 @@ class H2StreamSuite extends Http4sSuite {
       _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Closed, writeWindow = 0))
       _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 10))
       closed <- stream.state.get
-      outgoing <- queue.tryTake
+      outgoing <- queue.tryTake.flatMap(_.traverse(_.frames))
     } yield {
       assertEquals(halfClosed.writeWindow, 0)
       assertEquals(closed.writeWindow, 0)
@@ -505,7 +578,7 @@ class H2StreamSuite extends Http4sSuite {
       _ <- stream.state.update(_.copy(writeWindow = -10))
       _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 5))
       updated <- stream.state.get
-      outgoing <- queue.tryTake
+      outgoing <- queue.tryTake.flatMap(_.traverse(_.frames))
     } yield {
       assertEquals(updated.state, H2Stream.StreamState.Open)
       assertEquals(updated.writeWindow, -5)
@@ -520,7 +593,7 @@ class H2StreamSuite extends Http4sSuite {
       _ <- stream.state.update(_.copy(writeWindow = Int.MaxValue))
       _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 1))
       updated <- stream.state.get
-      outgoing <- queue.take
+      outgoing <- queue.take.flatMap(_.frames)
       reset = outgoing.collectFirst { case frame: H2Frame.RstStream => frame }
     } yield {
       assertEquals(updated.state, H2Stream.StreamState.Closed)
@@ -539,7 +612,7 @@ class H2StreamSuite extends Http4sSuite {
         H2Frame.Data(1, ByteVector.empty, Some(ByteVector.fill(2)(0)), endStream = false)
       )
       updated <- stream.state.get
-      outgoing <- queue.take
+      outgoing <- queue.take.flatMap(_.frames)
       reset = outgoing.collectFirst { case frame: H2Frame.RstStream => frame }
     } yield {
       assertEquals(updated.state, H2Stream.StreamState.Closed)
@@ -553,7 +626,7 @@ class H2StreamSuite extends Http4sSuite {
       (stream, queue) = sq
       _ <- stream.state.update(_.copy(state = H2Stream.StreamState.Closed))
       _ <- stream.rstStream(H2Error.StreamClosed)
-      outgoing <- queue.tryTake
+      outgoing <- queue.tryTake.flatMap(_.traverse(_.frames))
     } yield assertEquals(outgoing, None)
   }
 
@@ -584,7 +657,7 @@ class H2StreamSuite extends Http4sSuite {
           completed =>
             for {
               _ <- IO.sleep(1.seconds)
-              premature <- queue.tryTake
+              premature <- queue.tryTake.flatMap(_.traverse(_.frames))
               _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 11))
               _ <- completed.flatMap(_.embedNever)
             } yield premature
@@ -801,8 +874,8 @@ class H2StreamSuite extends Http4sSuite {
     }
   }
 
-  private def drainFrames(queue: Queue[IO, Chunk[H2Frame]]): IO[Vector[H2Frame]] =
-    queue.tryTake.flatMap {
+  private def drainFrames(queue: Queue[IO, H2Write[IO]]): IO[Vector[H2Frame]] =
+    queue.tryTake.flatMap(_.traverse(_.frames)).flatMap {
       case Some(chunk) => drainFrames(queue).map(chunk.toVector ++ _)
       case None => IO.pure(Vector.empty)
     }
@@ -830,51 +903,29 @@ class H2StreamSuite extends Http4sSuite {
         for {
           delegate <- Hpack.create[IO](1024)
           decoder <- Hpack.create[IO](1024)
-          outgoing <- Queue.unbounded[IO, Chunk[H2Frame]]
-          entered <- Deferred[IO, Unit]
-          resume <- Deferred[IO, Unit]
-          calls <- Ref[IO].of(0)
-          gated = new Hpack[IO] {
-            def encodeHeaders(headers: NonEmptyList[(String, String, Boolean)]): IO[ByteVector] =
-              delegate.encodeHeaders(headers)
-            def encodeHeadersWith[A](headers: NonEmptyList[(String, String, Boolean)])(
-                send: ByteVector => IO[A]
-            ): IO[A] =
-              delegate.encodeHeadersWith(headers) { bytes =>
-                calls.getAndUpdate(_ + 1).flatMap {
-                  case 0 => entered.complete(()).void >> resume.get >> send(bytes)
-                  case _ => send(bytes)
-                }
-              }
-            def updateEncoderTableSize(size: Int): IO[Unit] = delegate.updateEncoderTableSize(size)
-            def decodeHeaders(bytes: ByteVector): IO[List[(String, String)]] =
-              delegate.decodeHeaders(bytes)
-            def decodeHeadersAndDiscard(bytes: ByteVector): IO[Unit] =
-              delegate.decodeHeadersAndDiscard(bytes)
-          }
+          outgoing <- Queue.unbounded[IO, H2Write[IO]]
           firstPair <- streamAndQueue(
             defaultSettings,
-            hpackOverride = Some(gated),
+            hpackOverride = Some(delegate),
             id = if (firstBlock == "push promise") 2 else 1,
             outgoingOverride = Some(outgoing),
           )
           secondPair <- streamAndQueue(
             defaultSettings,
-            hpackOverride = Some(gated),
+            hpackOverride = Some(delegate),
             id = if (secondBlock == "push promise") 4 else 3,
             outgoingOverride = Some(outgoing),
           )
           (first, _) = firstPair
           (second, _) = secondPair
-          _ <- send(first, firstBlock).background
-            .use { firstDone =>
-              entered.get >> send(second, secondBlock).background.use { secondDone =>
-                IO.sleep(1.second) >> assertIO(outgoing.size, 0) >>
-                  resume.complete(()) >> firstDone.flatMap(_.embedNever) >>
-                  secondDone.flatMap(_.embedNever)
+          chunks <- send(first, firstBlock).background.use { firstDone =>
+            IO.sleep(1.millis).untilM_(outgoing.size.map(_ == 1)) >>
+              send(second, secondBlock).background.use { secondDone =>
+                outgoing.take.flatMap(_.frames).replicateA(2).flatTap { _ =>
+                  firstDone.flatMap(_.embedNever) >> secondDone.flatMap(_.embedNever)
+                }
               }
-            }
-          chunks <- outgoing.take.replicateA(2)
+          }
           frames = chunks.flatMap(_.toList)
           blocks = frames.collect {
             case frame: H2Frame.Headers => frame.headerBlock
@@ -1107,7 +1158,7 @@ class H2StreamSuite extends Http4sSuite {
       before <- drainFrames(queue)
       window <- stream.state.get.map(_.readWindow)
       reader <- stream.readBody.compile.drain.start
-      update <- queue.take
+      update <- queue.take.flatMap(_.frames)
       _ <- reader.cancel
     } yield {
       assertEquals(before, Vector.empty)
@@ -1119,8 +1170,8 @@ class H2StreamSuite extends Http4sSuite {
   test("stream credit is reserved before a blocked DATA queue offer") {
     TestControl.executeEmbed {
       for {
-        outgoing <- Queue.bounded[IO, Chunk[H2Frame]](1)
-        _ <- outgoing.offer(Chunk.singleton(H2Frame.Ping.default))
+        outgoing <- Queue.bounded[IO, H2Write[IO]](1)
+        _ <- outgoing.offer(H2Write.one(H2Frame.Ping.default))
         pair <- streamAndQueue(defaultSettings, outgoingOverride = Some(outgoing))
         (stream, _) = pair
         _ <- stream.state.update(_.copy(writeWindow = Int.MaxValue))
@@ -1128,7 +1179,7 @@ class H2StreamSuite extends Http4sSuite {
         _ <- IO.sleep(1.seconds)
         _ <- stream.receiveWindowUpdate(H2Frame.WindowUpdate(1, 1))
         reserved <- stream.state.get
-        _ <- outgoing.take
+        _ <- outgoing.take.flatMap(_.frames)
         _ <- sending.joinWithNever
         frames <- drainFrames(outgoing)
       } yield {

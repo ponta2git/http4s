@@ -158,3 +158,36 @@ and `ember-server` with Scala 3.3.6, then pass the generated fork version as the
 argument to `/private/tmp/momo-http2-handoff/run.sh`. Validation used the temporary
 version `0.23.37-momo-handoff-validation-SNAPSHOT`; applications should pin the
 clean commit-derived version described above instead.
+
+## SETTINGS ACK follow-up (2026-10-11)
+
+The additional momo-result probe reproduced a SETTINGS ACK waiting behind DATA
+at an exhausted connection window, although PING still received its ACK.
+SETTINGS acknowledgements now use the control queue, including while DATA waits
+for either connection or stream credit (RFC 9113 §6.5.3).
+
+The connection writer also owns deferred HPACK encoding. Table-size changes and
+their ACK are one ordered control operation; queued field sections are encoded
+and fragmented when transmitted, preserving the size-update boundary required
+by RFC 9113 §4.3.1 and RFC 7541 §4.2. Canceling a header offer before admission
+therefore cannot leave the encoder ahead of its peer. A disabled, unsent push
+is suppressed without mutating HPACK or sending a reset for an unknown stream.
+
+DATA reservations distinguish queued bytes from bytes actually transmitted.
+After an ACK, queued DATA obeys a reduced stream window and maximum frame size;
+stream WINDOW_UPDATE still reaches queued terminal DATA after handler cleanup.
+Window-overflow checks include reserved but unsent bytes. Deferred empty work
+cannot complete another operation's write barrier during graceful shutdown.
+
+Validation of the follow-up:
+
+- JVM Scala 3.3.6: Ember core/server/client passed 263/53/34 tests (two existing
+  ignored tests); MiMa passed for all three modules. The affected connection,
+  stream, and server lifecycle suites passed again after the final accounting
+  adjustments.
+- Scala.js and Scala 2.13.18 each passed 116 connection/stream tests during this
+  follow-up.
+- `run-settings-ack.sh` failed against `f1918359ab80` and passed against the revised
+  artifacts. The original `run.sh` also passed all three lifecycle/HEAD probes.
+  The scripts accept the clean commit-derived version as their first argument;
+  the temporary validation version was `0.23.37-momo-settings-ack-validation-SNAPSHOT`.

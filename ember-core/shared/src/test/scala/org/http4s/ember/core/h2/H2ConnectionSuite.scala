@@ -42,17 +42,18 @@ class H2ConnectionSuite extends Http4sSuite {
   private def testSocket(
       bytes: ByteVector,
       onWrite: Chunk[Byte] => IO[Unit],
+      onRead: Option[IO[Option[Chunk[Byte]]]] = None,
   ): IO[Socket[IO]] =
     Ref[IO].of(bytes).map { ref =>
       new Socket[IO] {
         def read(maxBytes: Int): IO[Option[Chunk[Byte]]] =
-          ref.modify { bv =>
+          onRead.getOrElse(ref.modify { bv =>
             if (bv.isEmpty) (bv, None)
             else {
               val (h, t) = bv.splitAt(maxBytes.toLong)
               (t, Some(Chunk.byteVector(h)))
             }
-          }
+          })
         // Implement only as necessary...
         def endOfInput: IO[Unit] = ???
         def endOfOutput: IO[Unit] = ???
@@ -80,9 +81,9 @@ class H2ConnectionSuite extends Http4sSuite {
       connectionType: H2Connection.ConnectionType = H2Connection.ConnectionType.Server,
       socketOverride: Option[Socket[IO]] = None,
       idleTimeout: Duration = Duration.Inf,
-      outgoingOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
+      outgoingOverride: Option[Queue[IO, H2Write[IO]]] = None,
       handshakeComplete: Boolean = true,
-      controlOverride: Option[Queue[IO, Chunk[H2Frame]]] = None,
+      controlOverride: Option[Queue[IO, H2Write[IO]]] = None,
   ): IO[H2Connection[IO]] =
     for {
       socket <- socketOverride.fold(readOnlySocket(input))(_.pure[IO])
@@ -92,7 +93,7 @@ class H2ConnectionSuite extends Http4sSuite {
         H2Frame.Settings.ConnectionSettings.default.initialWindowSize,
         H2Frame.Settings.ConnectionSettings.default.initialWindowSize,
       )
-      outgoing <- outgoingOverride.fold(Queue.unbounded[IO, Chunk[H2Frame]])(IO.pure)
+      outgoing <- outgoingOverride.fold(Queue.unbounded[IO, H2Write[IO]])(IO.pure)
       created <- Queue.unbounded[IO, Int]
       closed <- Queue.unbounded[IO, Int]
       hpack <- Hpack.create[IO](
@@ -159,7 +160,7 @@ class H2ConnectionSuite extends Http4sSuite {
 
   private def drainOutgoing(h2: H2Connection[IO]): IO[Vector[H2Frame]] =
     h2.outgoing.tryTake.flatMap {
-      case Some(c) => drainOutgoing(h2).map(c.toVector ++ _)
+      case Some(write) => write.frames.flatMap(c => drainOutgoing(h2).map(c.toVector ++ _))
       case None => IO.pure(Vector.empty)
     }
 
@@ -275,7 +276,7 @@ class H2ConnectionSuite extends Http4sSuite {
         _ <- h2.state.update(_.copy(writeWindow = 0))
         writeFiber <- h2.writeLoop.compile.drain.start
         expected = H2Frame.Data(1, ByteVector.empty, None, endStream = true)
-        _ <- h2.outgoing.offer(Chunk.singleton(expected))
+        _ <- h2.outgoing.offer(H2Write.now(Chunk.singleton(expected)))
         bytes <- writes.take.timeout(1.second)
         _ <- writeFiber.cancel
         actual = H2Frame.RawFrame
@@ -691,7 +692,7 @@ class H2ConnectionSuite extends Http4sSuite {
         )
         _ <- h2.state.update(_.copy(writeWindow = 0))
         loop <- h2.writeLoop.compile.drain.start
-        _ <- h2.outgoing.offer(dataFrame(16))
+        _ <- h2.outgoing.offer(H2Write.now(dataFrame(16)))
         _ <- loop.join
         st <- h2.state.get
         out <- writes.get
@@ -720,7 +721,7 @@ class H2ConnectionSuite extends Http4sSuite {
         )
         _ <- h2.state.update(_.copy(writeWindow = 0))
         loop <- h2.writeLoop.compile.drain.start
-        _ <- h2.outgoing.offer(dataFrame(16))
+        _ <- h2.outgoing.offer(H2Write.now(dataFrame(16)))
         _ <- IO.sleep(idle / 2)
         _ <- increaseWindowSize(h2, 1 << 20)
         _ <- IO.sleep(idle)
@@ -748,10 +749,10 @@ class H2ConnectionSuite extends Http4sSuite {
           writes,
         )
         loop <- h2.writeLoop.compile.drain.start
-        _ <- h2.outgoing.offer(dataFrame(16))
+        _ <- h2.outgoing.offer(H2Write.now(dataFrame(16)))
         _ <- IO.sleep(idle * 10)
         _ <- h2.state.update(_.copy(writeWindow = 0))
-        _ <- h2.outgoing.offer(dataFrame(16))
+        _ <- h2.outgoing.offer(H2Write.now(dataFrame(16)))
         _ <- IO.sleep(idle / 2)
         midway <- h2.state.get
         _ <- increaseWindowSize(h2, 1 << 20)
@@ -781,7 +782,7 @@ class H2ConnectionSuite extends Http4sSuite {
         )
         _ <- h2.state.update(_.copy(writeWindow = 0))
         loop <- h2.writeLoop.compile.drain.start
-        _ <- h2.outgoing.offer(Chunk.singleton(H2Frame.Ping.ack))
+        _ <- h2.outgoing.offer(H2Write.now(Chunk.singleton(H2Frame.Ping.ack)))
         _ <- IO.sleep(idle * 10)
         _ <- loop.cancel
         st <- h2.state.get
@@ -807,7 +808,9 @@ class H2ConnectionSuite extends Http4sSuite {
         _ <- h2.state.update(_.copy(writeWindow = 0))
         expected = H2Frame.Data(1, ByteVector.empty, None, endStream = true)
         st <- h2.writeLoop.compile.drain.background.use { _ =>
-          h2.outgoing.offer(Chunk.singleton(expected)) >> IO.sleep(10.seconds) >> h2.state.get
+          h2.outgoing.offer(H2Write.now(Chunk.singleton(expected))) >> IO.sleep(
+            10.seconds
+          ) >> h2.state.get
         }
         out <- writes.get
       } yield {
@@ -832,8 +835,10 @@ class H2ConnectionSuite extends Http4sSuite {
         _ <- h2.state.update(_.copy(writeWindow = 0))
         _ <- h2.writeLoop.compile.drain.background.use { completed =>
           h2.outgoing.offer(
-            Chunk.singleton(
-              H2Frame.Data(1, ByteVector.empty, Some(ByteVector.empty), endStream = true)
+            H2Write.now(
+              Chunk.singleton(
+                H2Frame.Data(1, ByteVector.empty, Some(ByteVector.empty), endStream = true)
+              )
             )
           ) >> completed.void
         }
@@ -867,7 +872,9 @@ class H2ConnectionSuite extends Http4sSuite {
         )
         _ <- h2.state.update(_.copy(writeWindow = Int.MaxValue))
         frames <- h2.writeLoop.compile.drain.background.use { _ =>
-          h2.outgoing.offer(dataFrame(1)) >> writing.get >> h2.readLoop >> drainOutgoing(h2)
+          h2.outgoing.offer(
+            H2Write.now(dataFrame(1))
+          ) >> writing.get >> h2.readLoop >> drainOutgoing(h2)
         }
         st <- h2.state.get
       } yield {
@@ -916,15 +923,17 @@ class H2ConnectionSuite extends Http4sSuite {
     )
   }
 
-  test("canceling an encoded header blocked on a full queue aborts connection waiters") {
+  test("canceling an unencoded header offer leaves the connection compression state usable") {
     TestControl.executeEmbed {
-      val headers = NonEmptyList.one(("x-dynamic", "value", false))
-      val queued = Chunk.singleton[H2Frame](
-        H2Frame.Ping(0, ack = false, ByteVector.fill(8)(0))
+      val headers = NonEmptyList.of(
+        (":method", "GET", false),
+        (":scheme", "https", false),
+        (":path", "/", false),
+        ("x-dynamic", "value", false),
       )
       for {
-        outgoing <- Queue.bounded[IO, Chunk[H2Frame]](1)
-        _ <- outgoing.offer(queued)
+        outgoing <- Queue.bounded[IO, H2Write[IO]](1)
+        _ <- outgoing.offer(H2Write.one(H2Frame.Ping.default))
         h2 <- mkConnection(
           H2Frame.Settings.ConnectionSettings.default,
           ByteVector.empty,
@@ -932,31 +941,22 @@ class H2ConnectionSuite extends Http4sSuite {
           outgoingOverride = Some(outgoing),
         )
         stream <- h2.initiateLocalStream
-        streamState <- stream.state.get
-        _ <- streamState.readBuffer.send(Right(ByteVector.empty)).replicateA_(128)
-        _ <- stream
-          .sendHeaders(headers, endStream = false)
-          .background
-          .use(_ => IO.sleep(1.second))
-          .timeout(2.seconds)
+        _ <- stream.sendHeaders(headers, endStream = false).background.use(_ => IO.sleep(1.second))
         closed <- h2.state.get.map(_.closed)
-        response <- stream.getResponse.attempt.timeout(1.second)
-        body <- stream.readBody.compile.drain.attempt.timeout(1.second)
-        write <- streamState.writeBlock.get.timeout(1.second)
-        connectionWrite <- h2.state.get.flatMap(_.writeBlock.get).timeout(1.second)
-        subsequent <- h2.initiateLocalStream
-          .flatMap(_.sendHeaders(headers, endStream = false))
-          .attempt
-          .timeout(1.second)
+        queued <- drainOutgoing(h2)
+        next <- h2.initiateLocalStream
+        _ <- next.sendHeaders(headers, endStream = true)
         frames <- drainOutgoing(h2)
+        decoder <- Hpack.create[IO](4096)
+        fields <- decoder.decodeHeaders(
+          frames
+            .collect { case h: H2Frame.Headers => h.headerBlock }
+            .foldLeft(ByteVector.empty)(_ ++ _)
+        )
       } yield {
-        assert(closed)
-        assert(response.isLeft, clue(response))
-        assert(body.isLeft, clue(body))
-        assert(write.isLeft, clue(write))
-        assert(connectionWrite.isLeft, clue(connectionWrite))
-        assert(subsequent.isLeft, clue(subsequent))
-        assertEquals(frames, queued.toVector)
+        assert(!closed)
+        assertEquals(queued, Vector(H2Frame.Ping.default))
+        assertEquals(fields, headers.toList.map { case (name, value, _) => (name, value) })
       }
     }
   }
@@ -1123,7 +1123,7 @@ class H2ConnectionSuite extends Http4sSuite {
     TestControl.executeEmbed {
       for {
         output <- Queue.unbounded[IO, Chunk[Byte]]
-        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        control <- Queue.unbounded[IO, H2Write[IO]]
         socket <- testSocket(ByteVector.empty, output.offer)
         h2 <- mkConnection(
           H2Frame.Settings.ConnectionSettings.default,
@@ -1134,8 +1134,8 @@ class H2ConnectionSuite extends Http4sSuite {
         )
         _ <- h2.state.update(_.copy(writeWindow = 0))
         _ <- h2.writeLoop.compile.drain.background.use { _ =>
-          h2.outgoing.offer(dataFrame(1)) >> IO.sleep(1.second) >>
-            control.offer(Chunk.singleton(H2Frame.Ping.ack)) >>
+          h2.outgoing.offer(H2Write.now(dataFrame(1))) >> IO.sleep(1.second) >>
+            control.offer(H2Write.now(Chunk.singleton(H2Frame.Ping.ack))) >>
             Stream
               .repeatEval(output.take)
               .filter(_.nonEmpty)
@@ -1165,7 +1165,7 @@ class H2ConnectionSuite extends Http4sSuite {
         _ <- h2.state.update(_.copy(writeWindow = 5))
         _ <- h2.writeLoop.compile.drain.background.use { _ =>
           for {
-            _ <- h2.outgoing.offer(dataFrame(10))
+            _ <- h2.outgoing.offer(H2Write.now(dataFrame(10)))
             first <- output.take.timeout(1.second)
             _ = assertEquals(
               decodeFrames(first.toByteVector).collect { case d: H2Frame.Data => d.data.size },
@@ -1239,7 +1239,7 @@ class H2ConnectionSuite extends Http4sSuite {
     TestControl.executeEmbed {
       for {
         output <- Ref.of[IO, ByteVector](ByteVector.empty)
-        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        control <- Queue.unbounded[IO, H2Write[IO]]
         socket <- testSocket(ByteVector.empty, bytes => output.update(_ ++ bytes.toByteVector))
         h2 <- mkConnection(
           H2Frame.Settings.ConnectionSettings.default,
@@ -1253,7 +1253,7 @@ class H2ConnectionSuite extends Http4sSuite {
         _ <- h2.state.update(_.copy(writeWindow = 0))
         _ <- h2.writeLoop.compile.drain.background.use { _ =>
           for {
-            _ <- h2.outgoing.offer(dataFrame(1))
+            _ <- h2.outgoing.offer(H2Write.now(dataFrame(1)))
             _ <- IO.sleep(1.second)
             _ <- h2.beginGracefulShutdown.timeout(1.second)
             frames <- output.get.map(decodeFrames)
@@ -1285,7 +1285,7 @@ class H2ConnectionSuite extends Http4sSuite {
           socketOverride = Some(socket),
         )
         _ <- h2.writeLoop.compile.drain.background.use { _ =>
-          h2.outgoing.offer(dataFrame(1)) >> started.get >>
+          h2.outgoing.offer(H2Write.now(dataFrame(1))) >> started.get >>
             (h2.flushWrites >> flushed.complete(())).background.use { _ =>
               IO.sleep(1.second) >> flushed.tryGet.flatMap(value =>
                 IO(assertEquals(value, None))
@@ -1329,7 +1329,7 @@ class H2ConnectionSuite extends Http4sSuite {
     TestControl.executeEmbed {
       for {
         written <- Queue.unbounded[IO, H2Frame]
-        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        control <- Queue.unbounded[IO, H2Write[IO]]
         socket <- testSocket(
           ByteVector.empty,
           bytes => decodeFrames(bytes.toByteVector).toList.traverse_(written.offer),
@@ -1343,8 +1343,8 @@ class H2ConnectionSuite extends Http4sSuite {
         _ <- h2.writeLoop.compile.drain.background.use { _ =>
           (for {
             _ <- (
-              control.offer(Chunk.singleton(H2Frame.Ping.ack)),
-              h2.outgoing.offer(dataFrame(1)),
+              control.offer(H2Write.now(Chunk.singleton(H2Frame.Ping.ack))),
+              h2.outgoing.offer(H2Write.now(dataFrame(1))),
             ).parTupled
             first <- written.take.timeout(1.second)
             second <- written.take.timeout(1.second)
@@ -1359,7 +1359,7 @@ class H2ConnectionSuite extends Http4sSuite {
     TestControl.executeEmbed {
       for {
         output <- Ref.of[IO, ByteVector](ByteVector.empty)
-        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        control <- Queue.unbounded[IO, H2Write[IO]]
         socket <- testSocket(ByteVector.empty, bytes => output.update(_ ++ bytes.toByteVector))
         h2 <- mkConnection(
           H2Frame.Settings.ConnectionSettings.default,
@@ -1382,7 +1382,7 @@ class H2ConnectionSuite extends Http4sSuite {
             _ <- first.sendData(ByteVector.fill(4)(1), endStream = false)
             _ <- first.receiveRstStream(H2Error.Cancel.toRst(1))
             _ <- h2.mapRef.update(_ - 1)
-            _ <- control.offer(Chunk.singleton(H2Frame.Ping.ack))
+            _ <- control.offer(H2Write.now(Chunk.singleton(H2Frame.Ping.ack)))
             _ <- next.sendHeaders(NonEmptyList.one((":status", "200", false)), endStream = false)
             _ <- next.sendData(ByteVector.fill(2)(3), endStream = true)
             _ <- increaseWindowSize(h2, 2)
@@ -1398,6 +1398,7 @@ class H2ConnectionSuite extends Http4sSuite {
               case h: H2Frame.Headers => h.identifier == 3; case _ => false
             })
             _ = assert(pending.isEmpty)
+            _ <- first.state.get.map(s => assertEquals(s.pendingWriteBytes, 0L))
           } yield ()
         }
       } yield ()
@@ -1408,7 +1409,7 @@ class H2ConnectionSuite extends Http4sSuite {
     TestControl.executeEmbed {
       for {
         output <- Ref.of[IO, ByteVector](ByteVector.empty)
-        control <- Queue.unbounded[IO, Chunk[H2Frame]]
+        control <- Queue.unbounded[IO, H2Write[IO]]
         socket <- testSocket(ByteVector.empty, bytes => output.update(_ ++ bytes.toByteVector))
         h2 <- mkConnection(
           H2Frame.Settings.ConnectionSettings.default,
@@ -1440,8 +1441,8 @@ class H2ConnectionSuite extends Http4sSuite {
   test("canceling a DATA offer to a full queue releases its pending bookkeeping") {
     TestControl.executeEmbed {
       for {
-        outgoing <- Queue.bounded[IO, Chunk[H2Frame]](1)
-        _ <- outgoing.offer(Chunk.singleton(H2Frame.Ping.ack))
+        outgoing <- Queue.bounded[IO, H2Write[IO]](1)
+        _ <- outgoing.offer(H2Write.now(Chunk.singleton(H2Frame.Ping.ack)))
         h2 <- mkConnection(
           H2Frame.Settings.ConnectionSettings.default,
           ByteVector.empty,
@@ -1451,10 +1452,124 @@ class H2ConnectionSuite extends Http4sSuite {
         _ <- stream.state.update(_.copy(state = H2Stream.StreamState.HalfClosedRemote))
         _ <- stream.sendData(ByteVector.fill(1)(1), endStream = false).background.use { _ =>
           IO.sleep(1.second) >> h2.state.get
-            .map(s => assertEquals(s.pendingData.get(1).map(_._2), Some(1)))
+            .map(s => assertEquals(s.pendingData.get(1).map(_.count), Some(1)))
         }
         pending <- h2.state.get.map(_.pendingData)
       } yield assert(pending.isEmpty)
+    }
+  }
+
+  test("SETTINGS ACK bypasses stalled DATA and queued fields use the acknowledged HPACK limit") {
+    TestControl.executeEmbed {
+      val fields = NonEmptyList.of((":status", "200", false), ("x-dynamic", "value", false))
+      for {
+        input <- Queue.unbounded[IO, Chunk[Byte]]
+        output <- Queue.unbounded[IO, H2Frame]
+        control <- Queue.unbounded[IO, H2Write[IO]]
+        outgoing <- Queue.bounded[IO, H2Write[IO]](1)
+        socket <- testSocket(
+          ByteVector.empty,
+          bytes => decodeFrames(bytes.toByteVector).toList.traverse_(output.offer),
+          Some(input.take.map(Some(_))),
+        )
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+          outgoingOverride = Some(outgoing),
+          controlOverride = Some(control),
+          idleTimeout = 10.seconds,
+        )
+        first <- h2.initiateRemoteStreamById(1)
+        next <- h2.initiateRemoteStreamById(3)
+        _ <- List(first, next).traverse_(
+          _.state.update(_.copy(state = H2Stream.StreamState.HalfClosedRemote))
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 0))
+        decoder <- Hpack.create[IO](4096)
+        _ <- (h2.writeLoop.compile.drain, h2.readLoop).parTupled.background.use { _ =>
+          for {
+            _ <- first.sendHeaders(fields, endStream = false)
+            seed <- output.take.timeout(1.second)
+            _ <- seed match {
+              case h: H2Frame.Headers => decoder.decodeHeaders(h.headerBlock).void
+              case other =>
+                IO.raiseError(new AssertionError(s"Expected initial headers, received $other"))
+            }
+            _ <- h2.outgoing.offer(H2Write.now(dataFrame(1)))
+            _ <- IO.sleep(1.second)
+            _ <- next.sendHeaders(fields, endStream = true)
+            _ <- input.offer(
+              Chunk.byteVector(
+                frameBytes(
+                  H2Frame.Settings(0, false, List(H2Frame.Settings.SettingsHeaderTableSize(0)))
+                )
+              )
+            )
+            ack <- output.take.timeout(1.second)
+            _ = assertEquals(ack, H2Frame.Settings.Ack)
+            _ <- increaseWindowSize(h2, 1)
+            _ <- h2.flushWrites.timeout(1.second)
+            data <- output.take.timeout(1.second)
+            header <- output.take.timeout(1.second)
+            decoded <- header match {
+              case h: H2Frame.Headers =>
+                IO(assertEquals(h.headerBlock.take(1), ByteVector(0x20.toByte))) >>
+                  decoder.decodeHeaders(h.headerBlock)
+              case other =>
+                IO.raiseError(new AssertionError(s"Expected queued headers, received $other"))
+            }
+            _ = assert(data.isInstanceOf[H2Frame.Data])
+            _ = assertEquals(decoded, fields.toList.map { case (name, value, _) => (name, value) })
+          } yield ()
+        }
+      } yield ()
+    }
+  }
+
+  test("padded DATA resumes when positive but insufficient connection credit is increased") {
+    TestControl.executeEmbed {
+      val expected = H2Frame.Data(1, ByteVector.empty, Some(ByteVector(1.toByte)), true)
+      for {
+        output <- Ref.of[IO, ByteVector](ByteVector.empty)
+        socket <- testSocket(ByteVector.empty, bytes => output.update(_ ++ bytes.toByteVector))
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+          idleTimeout = 10.seconds,
+        )
+        _ <- h2.state.update(_.copy(writeWindow = 1))
+        _ <- h2.writeLoop.compile.drain.background.use { _ =>
+          h2.outgoing.offer(H2Write.one(expected)) >> IO.sleep(1.second) >>
+            increaseWindowSize(h2, 1) >> h2.flushWrites.timeout(1.second)
+        }
+        frames <- output.get.map(decodeFrames)
+      } yield assertEquals(frames, Vector(expected))
+    }
+  }
+
+  test("an unrelated empty write cannot complete a later flush barrier") {
+    TestControl.executeEmbed {
+      for {
+        started <- Deferred[IO, Unit]
+        release <- Deferred[IO, Unit]
+        flushed <- Deferred[IO, Unit]
+        socket <- testSocket(ByteVector.empty, _ => started.complete(()).void >> release.get)
+        h2 <- mkConnection(
+          H2Frame.Settings.ConnectionSettings.default,
+          ByteVector.empty,
+          socketOverride = Some(socket),
+        )
+        _ <- h2.outgoing.offer(H2Write.now(Chunk.empty))
+        _ <- h2.outgoing.offer(H2Write.now(dataFrame(1)))
+        _ <- (h2.flushWrites >> flushed.complete(())).background.use { _ =>
+          IO.sleep(1.second) >> h2.writeLoop.compile.drain.background.use { _ =>
+            started.get >> flushed.tryGet.flatMap(result => IO(assertEquals(result, None))) >>
+              release.complete(()) >> flushed.get.timeout(1.second)
+          }
+        }
+      } yield ()
     }
   }
 

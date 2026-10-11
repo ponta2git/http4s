@@ -84,9 +84,9 @@ private[h2] object Hpack extends HpackPlatform {
             case true =>
               new IllegalStateException("HPACK encoder is no longer usable").raiseError[F, A]
             case false =>
-              // Queue offers must remain cancelable when a stalled writer has filled the queue.
-              // Once encoding has advanced the dynamic table, losing its block invalidates the
-              // connection. Poison the encoder before releasing the lock to any waiting sender.
+              // Encoding runs in writer order, after queue admission. Once the dynamic table
+              // advances, failure to produce the block invalidates the connection. Poison the
+              // encoder before releasing the lock to another writer.
               pendingTableSizes
                 .getAndSet(Nil)
                 .flatMap { sizes =>
